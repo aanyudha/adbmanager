@@ -49,6 +49,9 @@ class MainWindow(QMainWindow):
         top.addWidget(self.port_input)
         top.addWidget(self.connect_btn)
 
+        self.status_label = QLabel("🔴 Not connected")
+        self.status_label.setWordWrap(True)
+
         # ==== CONTROL BAR ====
         ctrl = QHBoxLayout()
         ctrl.addWidget(self.reboot_btn)
@@ -63,6 +66,8 @@ class MainWindow(QMainWindow):
         left.addWidget(QLabel("Devices"))
         left.addWidget(self.device_list)
         left.addLayout(ctrl)
+
+        left.addWidget(self.status_label)
 
         # ==== RIGHT ====
         right = QVBoxLayout()
@@ -104,17 +109,40 @@ class MainWindow(QMainWindow):
     def scan_devices(self):
         self.device_list.clear()
         self.devices = list_devices()
+
         for d in self.devices:
-            self.device_list.addItem(d.serial)
+            label = f"{d.serial} ({d.status})"
+            self.device_list.addItem(label)
 
     def select_device(self, item):
-        self.current_serial = item.text()
-        device = next(d for d in self.devices if d.serial == self.current_serial)
+        text = item.text()
+        serial = text.split(" ")[0]
+        self.current_serial = serial
+
+        device = next(d for d in self.devices if d.serial == serial)
         info = device.info()
+
         self.info_box.setText(
             "\n".join(f"{k.upper():15}: {v}" for k, v in info.items())
         )
 
+        if device.status == "unauthorized":
+            self.status_label.setText(
+                "🟡 Device terdeteksi\n\n"
+                "📺 Lihat layar STB\n"
+                "👉 Pilih 'Allow USB debugging'\n"
+                "☑ Centang 'Always allow'\n"
+                "⏳ Menunggu konfirmasi..."
+            )
+            self.set_controls_enabled(False)
+        elif device.status == "device":
+            self.status_label.setText("🟢 Device connected")
+            self.set_controls_enabled(True)
+    def set_controls_enabled(self, enabled: bool):
+        self.reboot_btn.setEnabled(enabled)
+        self.power_btn.setEnabled(enabled)
+        self.scrcpy_btn.setEnabled(enabled)
+        self.shot_btn.setEnabled(enabled)
     # ================= ACTIONS =================
 
     def reboot_device(self):
@@ -143,6 +171,26 @@ class MainWindow(QMainWindow):
     def watchdog(self):
         if not self.current_serial:
             return
+
         ip = self.ip_input.text().strip()
         port = self.port_input.text().strip()
+
         auto_reconnect(self.current_serial, ip, port)
+
+        from adb.manager import get_device_state
+        state = get_device_state(self.current_serial)
+
+        if state == "unauthorized":
+            self.status_label.setText(
+                "🟡 Waiting authorization\n"
+                "Please allow USB debugging on device"
+            )
+            self.set_controls_enabled(False)
+
+        elif state == "connected":
+            self.status_label.setText("🟢 Device authorized & ready")
+            self.set_controls_enabled(True)
+
+        else:
+            self.status_label.setText("🔴 Device offline")
+            self.set_controls_enabled(False)

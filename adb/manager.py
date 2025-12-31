@@ -52,3 +52,31 @@ def auto_reconnect(serial: str, ip: str, port: str):
         log_info("Device offline, reconnecting...")
         adb_connect(ip, port)
         time.sleep(2)
+
+def get_adb_devices():
+    result = subprocess.run(
+        ["adb", "devices"],
+        capture_output=True,
+        text=True
+    )
+    lines = result.stdout.strip().splitlines()[1:]
+
+    devices = []
+    for line in lines:
+        if not line.strip():
+            continue
+        serial, status = line.split()
+        devices.append((serial, status))
+
+    return devices
+def get_device_state(serial: str) -> str:
+    out = run_adb("adb devices")
+    for line in out.splitlines():
+        if serial in line:
+            if "unauthorized" in line:
+                return "unauthorized"
+            elif "\tdevice" in line:
+                return "connected"
+            else:
+                return "offline"
+    return "offline"
