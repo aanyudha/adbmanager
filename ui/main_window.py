@@ -1,7 +1,7 @@
 from PySide6.QtWidgets import (
     QMainWindow, QWidget, QVBoxLayout, QHBoxLayout,
     QPushButton, QListWidget, QTextEdit, QLabel,
-    QLineEdit, QMessageBox
+    QLineEdit, QMessageBox, QInputDialog
 )
 from PySide6.QtCore import QTimer
 from adb.device import list_devices
@@ -9,6 +9,8 @@ from adb.manager import (
     adb_connect, adb_reboot, adb_poweroff,
     adb_screenshot, launch_scrcpy, auto_reconnect
 )
+from utils.device_store import load_devices, add_device
+from adb.manager import get_device_status
 import time
 import os
 
@@ -41,6 +43,9 @@ class MainWindow(QMainWindow):
         self.info_box = QTextEdit()
         self.info_box.setReadOnly(True)
 
+        self.saved_list = QListWidget()
+        self.save_btn = QPushButton("Save Device")
+
         # ==== TOP BAR ====
         top = QHBoxLayout()
         top.addWidget(QLabel("IP"))
@@ -68,6 +73,9 @@ class MainWindow(QMainWindow):
         left.addLayout(ctrl)
 
         left.addWidget(self.status_label)
+        left.addWidget(QLabel("Saved Devices"))
+        left.addWidget(self.saved_list)
+        left.addWidget(self.save_btn)
 
         # ==== RIGHT ====
         right = QVBoxLayout()
@@ -95,7 +103,9 @@ class MainWindow(QMainWindow):
         self.timer = QTimer()
         self.timer.timeout.connect(self.watchdog)
         self.timer.start(5000)  # cek tiap 5 detik
-
+        self.load_saved_devices()
+        self.saved_list.itemClicked.connect(self.select_saved_device)
+        self.save_btn.clicked.connect(self.save_current_device)
         self.devices = []
 
     # ================= CORE =================
@@ -143,6 +153,37 @@ class MainWindow(QMainWindow):
         self.power_btn.setEnabled(enabled)
         self.scrcpy_btn.setEnabled(enabled)
         self.shot_btn.setEnabled(enabled)
+    def load_saved_devices(self):
+        self.saved_list.clear()
+        for d in load_devices():
+            self.saved_list.addItem(f'{d["name"]} ({d["ip"]}:{d["port"]})')
+    def save_current_device(self):
+        ip = self.ip_input.text().strip()
+        port = self.port_input.text().strip()
+
+        if not ip:
+            QMessageBox.warning(self, "Error", "IP address is empty")
+            return
+
+        name, ok = QInputDialog.getText(
+            self,
+            "Save Device",
+            "Device name:"
+        )
+
+        if ok and name.strip():
+            add_device(name.strip(), ip, port)
+            self.load_saved_devices()
+    def select_saved_device(self, item):
+        text = item.text()
+        name, addr = text.split(" (")
+        ip, port = addr[:-1].split(":")
+
+        self.ip_input.setText(ip)
+        self.port_input.setText(port)
+
+        result = adb_connect(ip, port)
+        QMessageBox.information(self, "ADB Connect", result)
     # ================= ACTIONS =================
 
     def reboot_device(self):
@@ -177,20 +218,23 @@ class MainWindow(QMainWindow):
 
         auto_reconnect(self.current_serial, ip, port)
 
-        from adb.manager import get_device_state
-        state = get_device_state(self.current_serial)
+        status = get_device_status(self.current_serial)
 
-        if state == "unauthorized":
+        if status == "UNAUTHORIZED":
             self.status_label.setText(
-                "🟡 Waiting authorization\n"
-                "Please allow USB debugging on device"
+                "🟡 Unauthorized\n"
+                "Allow USB debugging on device"
             )
             self.set_controls_enabled(False)
 
-        elif state == "connected":
-            self.status_label.setText("🟢 Device authorized & ready")
+        elif status == "CONNECTED":
+            self.status_label.setText("🟢 Connected & Ready")
             self.set_controls_enabled(True)
 
+        elif status == "OFFLINE":
+            self.status_label.setText("🔴 Offline")
+            self.set_controls_enabled(False)
+
         else:
-            self.status_label.setText("🔴 Device offline")
+            self.status_label.setText("⚫ OS Down / Not reachable")
             self.set_controls_enabled(False)

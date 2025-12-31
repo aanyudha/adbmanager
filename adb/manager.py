@@ -80,3 +80,16 @@ def get_device_state(serial: str) -> str:
             else:
                 return "offline"
     return "offline"
+def get_device_status(serial: str) -> str:
+    out = run_adb("adb devices")
+
+    for line in out.splitlines():
+        if serial in line:
+            if "unauthorized" in line:
+                return "UNAUTHORIZED"
+            elif "\tdevice" in line:
+                return "CONNECTED"
+            elif "offline" in line:
+                return "OFFLINE"
+
+    return "OS DOWN"
