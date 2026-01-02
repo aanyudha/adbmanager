@@ -155,8 +155,15 @@ class MainWindow(QMainWindow):
         self.shot_btn.setEnabled(enabled)
     def load_saved_devices(self):
         self.saved_list.clear()
-        for d in load_devices():
-            self.saved_list.addItem(f'{d["name"]} ({d["ip"]}:{d["port"]})')
+        self.saved_devices = load_devices()  # simpan internal
+
+        for d in self.saved_devices:
+            serial = f'{d["ip"]}:{d["port"]}'
+            status = get_device_status(serial)
+            status_text = self.format_status_icon(status)
+
+            item_text = f'{d["name"]} ({d["ip"]}:{d["port"]})    {status_text}'
+            self.saved_list.addItem(item_text)
     def save_current_device(self):
         ip = self.ip_input.text().strip()
         port = self.port_input.text().strip()
@@ -176,7 +183,9 @@ class MainWindow(QMainWindow):
             self.load_saved_devices()
     def select_saved_device(self, item):
         text = item.text()
-        name, addr = text.split(" (")
+        left = text.split("    ")[0]  # buang status
+        name, addr = left.split(" (")
+
         ip, port = addr[:-1].split(":")
 
         self.ip_input.setText(ip)
@@ -184,6 +193,15 @@ class MainWindow(QMainWindow):
 
         result = adb_connect(ip, port)
         QMessageBox.information(self, "ADB Connect", result)
+    def format_status_icon(self, status: str) -> str:
+        if status == "CONNECTED":
+            return "🟢 Connected"
+        elif status == "UNAUTHORIZED":
+            return "🟡 Unauthorized"
+        elif status == "OFFLINE":
+            return "🔴 Offline"
+        else:
+            return "⚫ OS Down"
     # ================= ACTIONS =================
 
     def reboot_device(self):
@@ -238,3 +256,19 @@ class MainWindow(QMainWindow):
         else:
             self.status_label.setText("⚫ OS Down / Not reachable")
             self.set_controls_enabled(False)
+        
+        self.refresh_saved_device_status()
+    
+    def refresh_saved_device_status(self):
+        if not hasattr(self, "saved_devices"):
+            return
+
+        self.saved_list.clear()
+
+        for d in self.saved_devices:
+            serial = f'{d["ip"]}:{d["port"]}'
+            status = get_device_status(serial)
+            status_text = self.format_status_icon(status)
+
+            item_text = f'{d["name"]} ({d["ip"]}:{d["port"]})    {status_text}'
+            self.saved_list.addItem(item_text)
