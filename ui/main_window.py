@@ -113,8 +113,10 @@ class MainWindow(QMainWindow):
         self.connect_btn.clicked.connect(self.connect_device)
         self.scan_btn.clicked.connect(self.scan_devices)
 
-        self.device_list.itemClicked.connect(self.select_scanned_device)
-        self.saved_list.itemClicked.connect(self.select_saved_device)
+        #self.device_list.itemClicked.connect(self.select_scanned_device)
+        #self.saved_list.itemClicked.connect(self.select_saved_device)
+        self.device_list.itemClicked.connect(self.on_scanned_clicked)
+        self.saved_list.itemClicked.connect(self.on_saved_clicked)
 
         self.save_btn.clicked.connect(self.save_current_device)
 
@@ -181,7 +183,92 @@ class MainWindow(QMainWindow):
             QMessageBox.warning(self, "Error", "No active device selected")
             return
         adb_vendor_settings_combo(self.active_serial)
-        
+    
+    def show_device_info(self, item):
+        serial = item.text()
+        device = next(d for d in self.devices if d.serial == serial)
+
+        info = device.info()
+
+        self.info_box.setText(
+            "\n".join(f"{k.upper():15}: {v}" for k, v in info.items())
+        )
+    
+    def on_scanned_clicked(self, item):
+        text = item.text()
+        serial = text.split()[1]  # 🟢 SERIAL (status)
+
+        self.active_serial = serial
+        self.status_label.setText(f"🟢 Active (Scanned): {serial}")
+        self.set_controls_enabled(True)
+
+        self.show_device_info_by_serial(serial)
+
+    def on_saved_clicked(self, item):
+        text = item.text()
+        addr = text.split("(")[1].split(")")[0]  # ip:port
+
+        self.active_serial = addr
+        ip, port = addr.split(":")
+
+        adb_connect(ip, port)
+        self.status_label.setText(f"🟢 Active (Saved): {addr}")
+        self.set_controls_enabled(True)
+
+        self.show_device_info_by_serial(addr)
+    
+    def show_device_info_by_serial(self, serial):
+        try:
+            from adb.device import AndroidDevice
+            from adb.manager import get_device_status
+
+            status = get_device_status(serial)
+
+            if status != "CONNECTED" and status != "device":
+                self.info_box.setText(
+                    f"⚠ Device not ready\n\nStatus: {status}"
+                )
+                return
+
+            device = AndroidDevice(serial, status)
+            info = device.info()
+
+            self.info_box.setText(self.format_device_info(info))
+
+        except Exception as e:
+            self.info_box.setText(f"❌ Failed to read device info\n\n{e}")
+
+    def format_device_info(self, info: dict) -> str:
+        return f"""
+    📱 DEVICE INFORMATION
+    ────────────────────────────
+    Brand          : {info['brand']}
+    Model          : {info['model']}
+    Manufacturer   : {info['manufacturer']}
+    Device         : {info['device']}
+    Board          : {info['board']}
+    Hardware       : {info['hardware']}
+
+    🧠 ANDROID
+    ────────────────────────────
+    Android Version: {info['android_version']}
+    SDK Level      : {info['sdk']}
+    Security Patch : {info['security_patch']}
+
+    🧬 FIRMWARE
+    ────────────────────────────
+    Firmware       : {info['firmware']}
+    Build ID       : {info['build_id']}
+    Build Type     : {info['build_type']}
+    Build Tags     : {info['build_tags']}
+    Fingerprint    :
+    {info['fingerprint']}
+
+    ⚙ CPU / ABI
+    ────────────────────────────
+    Primary ABI    : {info['abi']}
+    ABI List       : {info['abi_list']}
+    """.strip()
     # ================= SAVED DEVICE =================
 
     def load_saved_devices(self):

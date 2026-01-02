@@ -1,4 +1,4 @@
-from adb.manager import run_adb
+from adb.manager import run_adb, get_device_status
 
 class AndroidDevice:
     def __init__(self, serial, status):
@@ -52,3 +52,11 @@ def list_devices():
             devices.append(AndroidDevice(serial, status))
 
     return devices
+
+class Device:
+    def __init__(self):
+        self.state = "no_device"
+
+    def refresh(self):
+        self.state = get_device_status()
+        return self.state
