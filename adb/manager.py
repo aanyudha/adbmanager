@@ -46,13 +46,6 @@ def is_device_online(serial: str) -> bool:
     out = run_adb("adb devices")
     return f"{serial}\tdevice" in out
 
-
-def auto_reconnect(serial: str, ip: str, port: str):
-    if not is_device_online(serial):
-        log_info("Device offline, reconnecting...")
-        adb_connect(ip, port)
-        time.sleep(2)
-
 def get_adb_devices():
     result = subprocess.run(
         ["adb", "devices"],
@@ -69,17 +62,7 @@ def get_adb_devices():
         devices.append((serial, status))
 
     return devices
-def get_device_state(serial: str) -> str:
-    out = run_adb("adb devices")
-    for line in out.splitlines():
-        if serial in line:
-            if "unauthorized" in line:
-                return "unauthorized"
-            elif "\tdevice" in line:
-                return "connected"
-            else:
-                return "offline"
-    return "offline"
+
 def get_device_status(serial: str) -> str:
     out = run_adb("adb devices")
 
@@ -93,3 +76,43 @@ def get_device_status(serial: str) -> str:
                 return "OFFLINE"
 
     return "OS DOWN"
+
+def auto_reconnect(serial, ip, port):
+    if get_device_status(serial) != "CONNECTED":
+        adb_connect(ip, port)
+        time.sleep(1)
+
+def adb_shell(serial, command):
+    return run_adb(f'adb -s {serial} shell {command}')
+
+def adb_send_key(serial: str, keycode: int, delay: float = 0.3):
+    run_adb(f"adb -s {serial} shell input keyevent {keycode}")
+    time.sleep(delay)
+
+def adb_vendor_settings_combo(serial: str):
+    """
+    Combo:
+    BACK → RIGHT → LEFT → RIGHT → LEFT → BACK
+    """
+    sequence = [
+        4,   # BACK
+        22,  # RIGHT
+        21,  # LEFT
+        22,  # RIGHT
+        21,  # LEFT
+        4    # BACK
+    ]
+
+    for key in sequence:
+        adb_send_key(serial, key)
+
+def adb_send_notification(serial: str, title: str, text: str):
+    """
+    Kirim notifikasi ke device Android 
+    """
+    cmd = (
+        f'adb -s {serial} shell '
+        f'cmd notification post '
+        f'"adbtool" "{title}" "{text}"'
+    )
+    run_adb(cmd)

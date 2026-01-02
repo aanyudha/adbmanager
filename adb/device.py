@@ -6,18 +6,36 @@ class AndroidDevice:
         self.status = status  # device / unauthorized / offline
 
     def get_prop(self, prop):
-        return run_adb(f"adb -s {self.serial} shell getprop {prop}").strip()
+        return run_adb(
+            f"adb -s {self.serial} shell getprop {prop}"
+        ).strip()
 
     def info(self):
+        """
+        Device information (safe to call only when CONNECTED)
+        """
         return {
             "serial": self.serial,
             "status": self.status,
+            "brand": self.get_prop("ro.product.brand"),
             "model": self.get_prop("ro.product.model"),
             "manufacturer": self.get_prop("ro.product.manufacturer"),
-            "android": self.get_prop("ro.build.version.release"),
-            "sdk": self.get_prop("ro.build.version.sdk"),
-            "abi": self.get_prop("ro.product.cpu.abi"),
+            "device": self.get_prop("ro.product.device"),
+            "board": self.get_prop("ro.product.board"),
             "hardware": self.get_prop("ro.hardware"),
+
+            "android_version": self.get_prop("ro.build.version.release"),
+            "sdk": self.get_prop("ro.build.version.sdk"),
+            "security_patch": self.get_prop("ro.build.version.security_patch"),
+
+            "firmware": self.get_prop("ro.build.display.id"),
+            "build_id": self.get_prop("ro.build.id"),
+            "build_type": self.get_prop("ro.build.type"),
+            "build_tags": self.get_prop("ro.build.tags"),
+            "fingerprint": self.get_prop("ro.build.fingerprint"),
+
+            "abi": self.get_prop("ro.product.cpu.abi"),
+            "abi_list": self.get_prop("ro.product.cpu.abilist"),
         }
 
 
