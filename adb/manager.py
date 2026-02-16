@@ -1,118 +1,134 @@
 import subprocess
 import time
-from utils.logger import log_error, log_info
+from utils.logger import log_error
 
-def run_adb(command: str) -> str:
+
+# =========================================================
+# CORE EXEC
+# =========================================================
+
+def run_adb(args) -> str:
     try:
-        result = subprocess.check_output(
-            command,
-            stderr=subprocess.STDOUT,
-            shell=True,
+        if isinstance(args, str):
+            args = args.split()
+
+        result = subprocess.run(
+            ["adb"] + args,
+            capture_output=True,
             text=True
         )
-        return result
-    except subprocess.CalledProcessError as e:
-        log_error(e.output)
-        return e.output
+        return result.stdout.strip()
 
+    except Exception as e:
+        log_error(str(e))
+        return str(e)
+
+
+# =========================================================
+# BASIC COMMANDS
+# =========================================================
 
 def adb_connect(ip: str, port: str) -> str:
-    cmd = f"adb connect {ip}:{port}"
-    return run_adb(cmd)
+    return run_adb(["connect", f"{ip}:{port}"])
 
 
 def adb_reboot(serial: str) -> str:
-    return run_adb(f"adb -s {serial} reboot")
+    return run_adb(["-s", serial, "reboot"])
 
 
 def adb_poweroff(serial: str) -> str:
-    return run_adb(f"adb -s {serial} shell reboot -p")
+    return run_adb(["-s", serial, "shell", "reboot", "-p"])
 
 
 def adb_screenshot(serial: str, filename: str) -> str:
-    cmd = f'adb -s {serial} exec-out screencap -p > "{filename}"'
-    return run_adb(cmd)
+    try:
+        with open(filename, "wb") as f:
+            subprocess.run(
+                ["adb", "-s", serial, "exec-out", "screencap", "-p"],
+                stdout=f
+            )
+        return "OK"
+    except Exception as e:
+        log_error(str(e))
+        return str(e)
 
+
+# =========================================================
+# SCRCPY
+# =========================================================
 
 def launch_scrcpy(serial: str):
-    # non-blocking
-    subprocess.Popen(
-        f"scrcpy -s {serial}",
-        shell=True
-    )
+    subprocess.Popen([
+        "scrcpy",
+        "-s", serial,
+        "--render-driver=direct3d",
+        "--max-size", "640",
+        "--video-bit-rate", "600K",
+        "--max-fps", "15",
+        "--no-audio"
+    ])
 
 
-def is_device_online(serial: str) -> bool:
-    out = run_adb("adb devices")
-    return f"{serial}\tdevice" in out
+# =========================================================
+# DEVICE STATUS
+# =========================================================
 
-def get_adb_devices():
-    result = subprocess.run(
-        ["adb", "devices"],
-        capture_output=True,
-        text=True
-    )
-    lines = result.stdout.strip().splitlines()[1:]
+def get_all_device_status():
+    out = run_adb(["devices"])
+    status_map = {}
 
-    devices = []
+    lines = out.splitlines()[1:]
+
     for line in lines:
         if not line.strip():
             continue
-        serial, status = line.split()
-        devices.append((serial, status))
+        parts = line.split()
+        if len(parts) >= 2:
+            serial, status = parts[0], parts[1]
+            status_map[serial] = status
 
-    return devices
+    return status_map
+
 
 def get_device_status(serial: str) -> str:
-    out = run_adb("adb devices")
+    status_map = get_all_device_status()
+    status = status_map.get(serial)
 
-    for line in out.splitlines():
-        if serial in line:
-            if "unauthorized" in line:
-                return "UNAUTHORIZED"
-            elif "\tdevice" in line:
-                return "CONNECTED"
-            elif "offline" in line:
-                return "OFFLINE"
+    if status == "device":
+        return "CONNECTED"
+    elif status == "unauthorized":
+        return "UNAUTHORIZED"
+    elif status == "offline":
+        return "OFFLINE"
+    else:
+        return "OS DOWN"
 
-    return "OS DOWN"
 
 def auto_reconnect(serial, ip, port):
     if get_device_status(serial) != "CONNECTED":
         adb_connect(ip, port)
         time.sleep(1)
 
+
 def adb_shell(serial, command):
-    return run_adb(f'adb -s {serial} shell {command}')
+    return run_adb(["-s", serial, "shell"] + command.split())
+
 
 def adb_send_key(serial: str, keycode: int, delay: float = 0.3):
-    run_adb(f"adb -s {serial} shell input keyevent {keycode}")
+    run_adb(["-s", serial, "shell", "input", "keyevent", str(keycode)])
     time.sleep(delay)
 
-def adb_vendor_settings_combo(serial: str):
-    """
-    Combo:
-    BACK → RIGHT → LEFT → RIGHT → LEFT → BACK
-    """
-    sequence = [
-        4,   # BACK
-        22,  # RIGHT
-        21,  # LEFT
-        22,  # RIGHT
-        21,  # LEFT
-        4    # BACK
-    ]
 
+def adb_vendor_settings_combo(serial: str):
+    sequence = [4, 22, 21, 22, 21, 4]
     for key in sequence:
         adb_send_key(serial, key)
 
+
 def adb_send_notification(serial: str, title: str, text: str):
-    """
-    Kirim notifikasi ke device Android 
-    """
-    cmd = (
-        f'adb -s {serial} shell '
-        f'cmd notification post '
-        f'"adbtool" "{title}" "{text}"'
-    )
-    run_adb(cmd)
+    run_adb([
+        "-s", serial,
+        "shell",
+        "cmd", "notification", "post",
+        "adbtool", title, text
+    ])

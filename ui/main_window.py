@@ -4,7 +4,7 @@ import time
 from PySide6.QtWidgets import (
     QMainWindow, QWidget, QVBoxLayout, QHBoxLayout,
     QPushButton, QListWidget, QTextEdit, QLabel,
-    QLineEdit, QMessageBox, QInputDialog
+    QLineEdit, QMessageBox, QInputDialog, QTabWidget, QFileDialog
 )
 from PySide6.QtCore import QTimer
 
@@ -13,7 +13,7 @@ from adb.manager import (
     adb_connect, adb_reboot, adb_poweroff,
     adb_screenshot, launch_scrcpy,
     auto_reconnect, get_device_status,
-    adb_shell, adb_vendor_settings_combo, adb_send_notification
+    adb_shell, adb_vendor_settings_combo, adb_send_notification, get_all_device_status
 )
 from utils.device_store import load_devices, add_device
 
@@ -24,11 +24,160 @@ class MainWindow(QMainWindow):
 
         self.setWindowTitle("Heisenberg ADB Control Tool")
         self.resize(1100, 600)
-        self.saved_timer = QTimer()
-        self.saved_timer.timeout.connect(self.refresh_saved_devices_status)
-        self.saved_timer.start(5000)  # refresh tiap 5 detik
+
         self.active_serial = None
         self.devices = []
+        self.saved_devices = []
+
+        # ===== TABS =====
+        self.tabs = QTabWidget()
+        self.tab_import = QWidget()
+        self.tab_control = QWidget()
+
+        self.init_import_tab()
+        self.init_control_tab()
+
+        self.tabs.addTab(self.tab_import, "Device Import")
+        self.tabs.addTab(self.tab_control, "ADB Control")
+
+        self.setCentralWidget(self.tabs)
+
+        # LOAD SAVED DEVICES SAAT STARTUP
+        self.load_saved_devices()
+
+        # ===== WATCHDOG =====
+        self.timer = QTimer()
+        self.timer.timeout.connect(self.watchdog)
+        self.timer.start(5000)
+
+        # ===== STATUS REFRESH =====
+        self.saved_timer = QTimer()
+        self.saved_timer.timeout.connect(self.refresh_saved_devices_status)
+        self.saved_timer.start(5000)
+
+    # =========================================================
+    # ================= TAB 1 : IMPORT ========================
+    # =========================================================
+
+    def init_import_tab(self):
+        layout = QVBoxLayout()
+
+        self.import_btn = QPushButton("Import Device TXT File")
+        self.import_btn.clicked.connect(self.import_device_file)
+        self.template_btn = QPushButton("Download Template TXT")
+        self.template_btn.clicked.connect(self.download_template_file)
+
+        self.import_log = QTextEdit()
+        self.import_log.setReadOnly(True)
+
+        layout.addWidget(QLabel("Import Devices (name, ip, port, private_key, public_key)"))
+        layout.addWidget(self.import_btn)
+        layout.addWidget(self.template_btn)
+        layout.addWidget(self.import_log)
+
+        self.tab_import.setLayout(layout)
+
+    def import_device_file(self):
+        file_path, _ = QFileDialog.getOpenFileName(
+            self, "Open Device File", "", "Text Files (*.txt)"
+        )
+        if not file_path:
+            return
+
+        devices = self.parse_device_file(file_path)
+
+        for d in devices:
+            add_device(
+                d.get("name"),
+                d.get("ip"),
+                d.get("port"),
+                d.get("private_key"),
+                d.get("public_key")
+            )
+
+        self.import_log.setText(
+            f"Imported {len(devices)} device(s) successfully."
+        )
+
+        self.load_saved_devices()
+
+    def parse_device_file(self, file_path):
+        devices = []
+        current = {}
+
+        with open(file_path, "r") as f:
+            for line in f:
+                line = line.strip()
+
+                if not line:
+                    if current:
+                        devices.append(current)
+                        current = {}
+                    continue
+
+                if "=" in line:
+                    key, value = line.split("=", 1)
+                    current[key.strip()] = value.strip()
+
+            if current:
+                devices.append(current)
+
+        return devices
+    
+    def download_template_file(self):
+        file_path, _ = QFileDialog.getSaveFileName(
+            self,
+            "Save Template File",
+            "device_template.txt",
+            "Text Files (*.txt)"
+        )
+
+        if not file_path:
+            return
+
+        template_content = """# ============================================
+    # Heisenberg ADB Control Tool - RAW KEY TEMPLATE
+    # ============================================
+    # IMPORTANT:
+    # Paste RAW ADB key strings directly (no file path)
+    # Leave one empty line between devices
+    # ============================================
+
+    name=STB_Ruangan_101
+    ip=192.168.1.101
+    port=5555
+    private_key=MIIEvQIBADANBgkqhkiG9w0BAQEFAASAMPLEPRIVATEKEY
+    public_key=MIIBIjANBgkqhkiG9w0BAQEFAAOCAQ8ASAMPLEPUBLICKEY
+
+    name=STB_Ruangan_102
+    ip=192.168.1.102
+    port=5555
+    private_key=MIIEvQIBADANBgkqhkiG9w0BAQEFAASAMPLEPRIVATEKEY2
+    public_key=MIIBIjANBgkqhkiG9w0BAQEFAAOCAQ8ASAMPLEPUBLICKEY2
+    """
+
+        try:
+            with open(file_path, "w", encoding="utf-8") as f:
+                f.write(template_content)
+
+            QMessageBox.information(
+                self,
+                "Template Saved",
+                f"Template file saved successfully:\n{file_path}"
+            )
+
+        except Exception as e:
+            QMessageBox.critical(
+                self,
+                "Error",
+                f"Failed to save template:\n{e}"
+            )
+
+    # =========================================================
+    # ================= TAB 2 : CONTROL =======================
+    # =========================================================
+
+    def init_control_tab(self):
 
         # ===== INPUT CONNECT =====
         self.ip_input = QLineEdit()
@@ -89,10 +238,10 @@ class MainWindow(QMainWindow):
         left.addWidget(self.scan_btn)
         left.addWidget(QLabel("Scanned Devices"))
         left.addWidget(self.device_list)
+        left.addWidget(self.save_btn)
         left.addLayout(action)
         left.addWidget(QLabel("Saved Devices"))
         left.addWidget(self.saved_list)
-        left.addWidget(self.save_btn)
         left.addWidget(self.status_label)
 
         right = QVBoxLayout()
@@ -105,19 +254,13 @@ class MainWindow(QMainWindow):
         main.addLayout(left, 1)
         main.addLayout(right, 2)
 
-        w = QWidget()
-        w.setLayout(main)
-        self.setCentralWidget(w)
+        self.tab_control.setLayout(main)
 
         # ===== SIGNALS =====
         self.connect_btn.clicked.connect(self.connect_device)
         self.scan_btn.clicked.connect(self.scan_devices)
-
-        #self.device_list.itemClicked.connect(self.select_scanned_device)
-        #self.saved_list.itemClicked.connect(self.select_saved_device)
         self.device_list.itemClicked.connect(self.on_scanned_clicked)
         self.saved_list.itemClicked.connect(self.on_saved_clicked)
-
         self.save_btn.clicked.connect(self.save_current_device)
 
         self.reboot_btn.clicked.connect(self.reboot_device)
@@ -125,16 +268,9 @@ class MainWindow(QMainWindow):
         self.scrcpy_btn.clicked.connect(self.scrcpy_device)
         self.shot_btn.clicked.connect(self.screenshot_device)
         self.settings_btn.clicked.connect(self.open_settings)
-
         self.cmd_exec_btn.clicked.connect(self.run_manual_command)
 
-        # ===== WATCHDOG =====
-        self.timer = QTimer()
-        self.timer.timeout.connect(self.watchdog)
-        self.timer.start(5000)
-
-        self.load_saved_devices()
-        self.set_controls_enabled(False)
+        
 
     # ================= CORE =================
 
@@ -179,7 +315,7 @@ class MainWindow(QMainWindow):
             b.setEnabled(enabled)
 
     def open_vendor_settings(self):
-        if not self.current_serial:
+        if not self.active_serial:
             QMessageBox.warning(self, "Error", "No active device selected")
             return
         adb_vendor_settings_combo(self.active_serial)
@@ -220,17 +356,16 @@ class MainWindow(QMainWindow):
     def show_device_info_by_serial(self, serial):
         try:
             from adb.device import AndroidDevice
-            from adb.manager import get_device_status
 
             status = get_device_status(serial)
 
-            if status != "CONNECTED" and status != "device":
+            if status != "CONNECTED":
                 self.info_box.setText(
                     f"⚠ Device not ready\n\nStatus: {status}"
                 )
                 return
 
-            device = AndroidDevice(serial, status)
+            device = AndroidDevice(serial, "device")
             info = device.info()
 
             self.info_box.setText(self.format_device_info(info))
@@ -272,12 +407,24 @@ class MainWindow(QMainWindow):
     # ================= SAVED DEVICE =================
 
     def load_saved_devices(self):
+        self.saved_devices = load_devices()
         self.saved_list.clear()
-        for d in load_devices():
-            state = get_device_status(f'{d["ip"]}:{d["port"]}')
-            icon = "🟢" if state == "CONNECTED" else "🔴"
+
+        status_map = get_all_device_status()
+
+        for d in self.saved_devices:
+            serial = f'{d["ip"]}:{d["port"]}'
+            raw_status = status_map.get(serial, "offline")
+
+            if raw_status == "device":
+                icon = "🟢"
+            elif raw_status == "unauthorized":
+                icon = "🟡"
+            else:
+                icon = "🔴"
+
             self.saved_list.addItem(
-                f'{icon} {d["name"]} ({d["ip"]}:{d["port"]})'
+                f'{icon} {d["name"]} ({serial})'
             )
 
     def save_current_device(self):
@@ -302,7 +449,12 @@ class MainWindow(QMainWindow):
         adb_poweroff(self.active_serial)
 
     def scrcpy_device(self):
+        if not self.active_serial:
+            return
+
+        self.timer.stop()
         launch_scrcpy(self.active_serial)
+        self.timer.start(5000)
 
     def screenshot_device(self):
         os.makedirs("screenshots", exist_ok=True)
@@ -332,9 +484,6 @@ class MainWindow(QMainWindow):
         self.info_box.setText(out)
         
     def refresh_saved_devices_status(self):
-        """
-        Refresh status icon saved devices TANPA mengubah selection
-        """
         if not hasattr(self, "saved_devices"):
             return
 
@@ -342,16 +491,24 @@ class MainWindow(QMainWindow):
         self.saved_list.blockSignals(True)
         self.saved_list.clear()
 
+        status_map = get_all_device_status()
+
         for d in self.saved_devices:
             serial = f'{d["ip"]}:{d["port"]}'
-            status = get_device_status(serial)
-            status_text = self.format_status_icon(status)
+            raw_status = status_map.get(serial, "offline")
 
-            item_text = f'{d["name"]} ({d["ip"]}:{d["port"]})    {status_text}'
-            self.saved_list.addItem(item_text)
+            if raw_status == "device":
+                icon = "🟢"
+            elif raw_status == "unauthorized":
+                icon = "🟡"
+            else:
+                icon = "🔴"
 
-        # restore selection
-        if current_row >= 0 and current_row < self.saved_list.count():
+            self.saved_list.addItem(
+                f'{icon} {d["name"]} ({serial})'
+            )
+
+        if 0 <= current_row < self.saved_list.count():
             self.saved_list.setCurrentRow(current_row)
 
         self.saved_list.blockSignals(False)

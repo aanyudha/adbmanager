@@ -1,4 +1,5 @@
-from adb.manager import run_adb, get_device_status
+from adb.manager import run_adb
+
 
 class AndroidDevice:
     def __init__(self, serial, status):
@@ -7,7 +8,7 @@ class AndroidDevice:
 
     def get_prop(self, prop):
         return run_adb(
-            f"adb -s {self.serial} shell getprop {prop}"
+            ["-s", self.serial, "shell", "getprop", prop]
         ).strip()
 
     def info(self):
@@ -43,20 +44,22 @@ def list_devices():
     """
     Ambil SEMUA device termasuk unauthorized
     """
-    output = run_adb("adb devices")
+    output = run_adb(["devices"])
     devices = []
 
     for line in output.splitlines():
         if "\t" in line and not line.startswith("List"):
             serial, status = line.split("\t")
-            devices.append(AndroidDevice(serial, status))
+            devices.append(AndroidDevice(serial.strip(), status.strip()))
 
     return devices
+
 
 class Device:
     def __init__(self):
         self.state = "no_device"
 
-    def refresh(self):
-        self.state = get_device_status()
+    def refresh(self, serial):
+        from adb.manager import get_device_status
+        self.state = get_device_status(serial)
         return self.state
