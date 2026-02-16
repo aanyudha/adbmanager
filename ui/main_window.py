@@ -335,6 +335,13 @@ class MainWindow(QMainWindow):
         serial = text.split()[1]  # 🟢 SERIAL (status)
 
         self.active_serial = serial
+
+        # AUTO FILL IP & PORT
+        if ":" in serial:
+            ip, port = serial.split(":")
+            self.ip_input.setText(ip)
+            self.port_input.setText(port)
+
         self.status_label.setText(f"🟢 Active (Scanned): {serial}")
         self.set_controls_enabled(True)
 
@@ -428,14 +435,19 @@ class MainWindow(QMainWindow):
             )
 
     def save_current_device(self):
-        ip = self.ip_input.text().strip()
-        port = self.port_input.text().strip()
-        if not ip:
+        if not self.active_serial:
             return
+
+        if ":" not in self.active_serial:
+            QMessageBox.warning(self, "Error", "Invalid device serial")
+            return
+
+        ip, port = self.active_serial.split(":")
 
         name, ok = QInputDialog.getText(
             self, "Save Device", "Device name:"
         )
+
         if ok and name:
             add_device(name, ip, port)
             self.load_saved_devices()
