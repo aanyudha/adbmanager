@@ -73,6 +73,19 @@ def launch_scrcpy(serial: str):
 # DEVICE STATUS
 # =========================================================
 
+import subprocess
+
+def connect_device(serial):
+    try:
+        result = subprocess.run(
+            ["adb", "connect", serial],
+            capture_output=True,
+            text=True
+        )
+        return result.stdout.strip()
+    except Exception as e:
+        return str(e)
+    
 def get_all_device_status():
     # 🔥 Warm-up call (force adb refresh internal state)
     run_adb(["devices"])

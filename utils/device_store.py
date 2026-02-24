@@ -1,8 +1,13 @@
 import json
 import os
 
-BASE_DIR = os.path.dirname(os.path.abspath(__file__))
-FILE = os.path.join(BASE_DIR, "saved_devices.json")
+BASE_DIR = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+DATA_DIR = os.path.join(BASE_DIR, "data")
+
+if not os.path.exists(DATA_DIR):
+    os.makedirs(DATA_DIR)
+
+FILE = os.path.join(DATA_DIR, "saved_devices.json")
 
 
 def load_devices():
@@ -19,20 +24,19 @@ def save_devices(devices):
 
 def add_device(name, ip, port, private_key=None, public_key=None):
 
-    # VALIDASI INPUT WAJIB
-    if not name or not ip or not port:
+    if not name or not ip:
         return
-    
+
+    port = str(port or "5555")   # ← HARD FIX
+
     devices = load_devices()
 
-    # cek device sudah ada atau belum
     existing = next(
-        (d for d in devices if d["ip"] == ip and d["port"] == port),
+        (d for d in devices if d["ip"] == ip and str(d["port"]) == port),
         None
     )
 
     if existing:
-        # update key jika diberikan
         if private_key is not None:
             existing["private_key"] = private_key
         if public_key is not None:
@@ -44,7 +48,6 @@ def add_device(name, ip, port, private_key=None, public_key=None):
             "port": port
         }
 
-        # hanya simpan key jika ada
         if private_key is not None:
             device_data["private_key"] = private_key
         if public_key is not None:

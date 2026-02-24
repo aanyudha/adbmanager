@@ -6,7 +6,7 @@ from PySide6.QtWidgets import (
     QPushButton, QListWidget, QTextEdit, QLabel,
     QLineEdit, QMessageBox, QInputDialog, QTabWidget, QFileDialog
 )
-from PySide6.QtCore import QTimer
+from PySide6.QtCore import QTimer, QThread, Signal
 
 from adb.device import list_devices
 from adb.manager import (
@@ -17,6 +17,48 @@ from adb.manager import (
 )
 from utils.device_store import load_devices, add_device
 
+class StatusWorker(QThread):
+    status_updated = Signal(dict)
+
+    def __init__(self, get_devices_callback, interval=3):
+        super().__init__()
+        self.get_devices = get_devices_callback
+        self.interval = interval
+        self.running = True
+
+    def run(self):
+        from adb.manager import run_adb
+        from adb.device import list_devices
+
+        while self.running:
+            try:
+                saved_devices = self.get_devices()
+
+                for d in saved_devices:
+                    serial = f'{d["ip"]}:{d["port"]}'
+                    run_adb(["connect", serial])
+
+                adb_devices = list_devices()
+
+                status_map = {
+                    dev.serial: dev.status
+                    for dev in adb_devices
+                }
+
+                self.status_updated.emit(status_map)
+
+            except Exception as e:
+                print("StatusWorker error:", e)
+
+            # sleep kecil-kecil supaya bisa exit cepat
+            for _ in range(int(self.interval * 10)):
+                if not self.running:
+                    return
+                self.msleep(100)
+
+
+    def stop(self):
+        self.running = False
 
 class MainWindow(QMainWindow):
     def __init__(self):
@@ -48,12 +90,19 @@ class MainWindow(QMainWindow):
         # ===== WATCHDOG =====
         self.timer = QTimer()
         self.timer.timeout.connect(self.watchdog)
-        self.timer.start(5000)
+        self.timer.start(3000)
 
         # ===== STATUS REFRESH =====
         #self.saved_timer = QTimer()
         #self.saved_timer.timeout.connect(self.refresh_saved_devices_status)
-        #self.saved_timer.start(5000)
+        #self.saved_timer.start(3000)
+        self.status_worker = StatusWorker(
+            get_devices_callback=lambda: self.saved_devices,
+            interval=3
+        )
+
+        self.status_worker.status_updated.connect(self.update_saved_device_status)
+        self.status_worker.start()
 
     # =========================================================
     # ================= TAB 1 : IMPORT ========================
@@ -85,12 +134,16 @@ class MainWindow(QMainWindow):
             return
 
         devices = self.parse_device_file(file_path)
-
+        print(devices)
         for d in devices:
+            if not d.get("name") or not d.get("ip"):
+                self.import_log.append(f"Skipped invalid entry: {d}")
+                continue
+
             add_device(
                 d.get("name"),
                 d.get("ip"),
-                d.get("port"),
+                d.get("port") or "5555",
                 d.get("private_key"),
                 d.get("public_key")
             )
@@ -117,7 +170,7 @@ class MainWindow(QMainWindow):
 
                 if "=" in line:
                     key, value = line.split("=", 1)
-                    current[key.strip()] = value.strip()
+                    current[key.strip().lower()] = value.strip()
 
             if current:
                 devices.append(current)
@@ -451,6 +504,41 @@ class MainWindow(QMainWindow):
         if ok and name:
             add_device(name, ip, port)
             self.load_saved_devices()
+    
+    def update_saved_device_status(self, status_map):
+        print("Received status update:", status_map)
+        current_row = self.saved_list.currentRow()
+
+        self.saved_devices = load_devices()
+
+        self.saved_list.blockSignals(True)
+        self.saved_list.clear()
+
+        for d in self.saved_devices:
+            serial = f'{d["ip"]}:{d["port"]}'
+            raw_status = status_map.get(serial, "offline")
+
+            if raw_status == "device":
+                icon = "🟢"
+            elif raw_status == "unauthorized":
+                icon = "🟡"
+            else:
+                icon = "🔴"
+
+            self.saved_list.addItem(
+                f'{icon} {d["name"]} ({serial})'
+            )
+
+        if 0 <= current_row < self.saved_list.count():
+            self.saved_list.setCurrentRow(current_row)
+
+        self.saved_list.blockSignals(False)
+    
+    def closeEvent(self, event):
+        if hasattr(self, "status_worker"):
+            self.status_worker.stop()
+            self.status_worker.wait(2000)  # timeout 2 detik
+        event.accept()
 
     # ================= ACTIONS =================
 
@@ -490,37 +578,6 @@ class MainWindow(QMainWindow):
         out = adb_shell(self.active_serial, cmd)
         self.info_box.setText(out)
         
-    def refresh_saved_devices_status(self):
-        current_row = self.saved_list.currentRow()
-
-        # 🔥 RELOAD FROM STORAGE EVERY REFRESH
-        self.saved_devices = load_devices()
-
-        self.saved_list.blockSignals(True)
-        self.saved_list.clear()
-
-        status_map = get_all_device_status()
-
-        for d in self.saved_devices:
-            serial = f'{d["ip"]}:{d["port"]}'
-            raw_status = status_map.get(serial, "offline")
-
-            if raw_status == "device":
-                icon = "🟢"
-            elif raw_status == "unauthorized":
-                icon = "🟡"
-            else:
-                icon = "🔴"
-
-            self.saved_list.addItem(
-                f'{icon} {d["name"]} ({serial})'
-            )
-
-        if 0 <= current_row < self.saved_list.count():
-            self.saved_list.setCurrentRow(current_row)
-
-        self.saved_list.blockSignals(False)
-
     def update_ui_by_status(self, status: str):
         if status == "UNAUTHORIZED":
             self.status_label.setText(
@@ -560,7 +617,7 @@ class MainWindow(QMainWindow):
         self.update_ui_by_status(status)
 
         # 🔥 FORCE REFRESH SAVED LIST
-        self.refresh_saved_devices_status()
+        #self.refresh_saved_devices_status()
 
         if status == "UNAUTHORIZED":
             adb_send_notification(
