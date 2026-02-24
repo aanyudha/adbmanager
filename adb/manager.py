@@ -74,6 +74,10 @@ def launch_scrcpy(serial: str):
 # =========================================================
 
 def get_all_device_status():
+    # 🔥 Warm-up call (force adb refresh internal state)
+    run_adb(["devices"])
+    time.sleep(0.3)
+
     out = run_adb(["devices"])
     status_map = {}
 
@@ -82,12 +86,15 @@ def get_all_device_status():
     for line in lines:
         if not line.strip():
             continue
+
         parts = line.split()
         if len(parts) >= 2:
-            serial, status = parts[0], parts[1]
+            serial = parts[0]
+            status = parts[1]
             status_map[serial] = status
 
     return status_map
+    
 
 
 def get_device_status(serial: str) -> str:
@@ -120,7 +127,9 @@ def adb_send_key(serial: str, keycode: int, delay: float = 0.3):
 
 
 def adb_vendor_settings_combo(serial: str):
-    sequence = [4, 22, 21, 22, 21, 4]
+    # Back → Right → Left → Right → Left → Up → Down → Back
+    sequence = [4, 22, 21, 22, 21, 19, 20, 4]
+
     for key in sequence:
         adb_send_key(serial, key)
 

@@ -51,9 +51,9 @@ class MainWindow(QMainWindow):
         self.timer.start(5000)
 
         # ===== STATUS REFRESH =====
-        self.saved_timer = QTimer()
-        self.saved_timer.timeout.connect(self.refresh_saved_devices_status)
-        self.saved_timer.start(5000)
+        #self.saved_timer = QTimer()
+        #self.saved_timer.timeout.connect(self.refresh_saved_devices_status)
+        #self.saved_timer.start(5000)
 
     # =========================================================
     # ================= TAB 1 : IMPORT ========================
@@ -475,18 +475,13 @@ class MainWindow(QMainWindow):
         QMessageBox.information(self, "Screenshot", f"Saved:\n{fn}")
 
     def open_settings(self):
-        # Kombinasi remote: back right left right left back
-        seq = [
-            "input keyevent 4",
-            "input keyevent 22",
-            "input keyevent 21",
-            "input keyevent 22",
-            "input keyevent 21",
-            "input keyevent 4",
-        ]
-        for cmd in seq:
-            adb_shell(self.active_serial, cmd)
-            time.sleep(0.3)
+        if not self.active_serial:
+            return
+
+        adb_shell(
+            self.active_serial,
+            "am start -n com.android.settings/.Settings"
+        )
 
     def run_manual_command(self):
         cmd = self.cmd_input.text().strip()
@@ -496,10 +491,11 @@ class MainWindow(QMainWindow):
         self.info_box.setText(out)
         
     def refresh_saved_devices_status(self):
-        if not hasattr(self, "saved_devices"):
-            return
-
         current_row = self.saved_list.currentRow()
+
+        # 🔥 RELOAD FROM STORAGE EVERY REFRESH
+        self.saved_devices = load_devices()
+
         self.saved_list.blockSignals(True)
         self.saved_list.clear()
 
@@ -555,13 +551,16 @@ class MainWindow(QMainWindow):
             self.set_controls_enabled(False)
 
     # ================= WATCHDOG =================
-
+  
     def watchdog(self):
         if not self.active_serial:
             return
 
         status = get_device_status(self.active_serial)
         self.update_ui_by_status(status)
+
+        # 🔥 FORCE REFRESH SAVED LIST
+        self.refresh_saved_devices_status()
 
         if status == "UNAUTHORIZED":
             adb_send_notification(
