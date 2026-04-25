@@ -1,5 +1,6 @@
 # Generated screenshots
 screenshots/*.png
+!screenshots/.gitkeep
 __pycache__/
 *.pyc
 *.pyo
@@ -7,5 +8,3 @@ __pycache__/
 build/
 dist/
 *.spec
-/screenshots/192.168.32.7_5555_1771238023.png
-/screenshots/192.168.32.7_5555_1771236489.png

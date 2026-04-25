@@ -38,3 +38,8 @@ At runtime:
 
 - bundled resources are extracted automatically by PyInstaller
 - writable files such as `data\saved_devices.json` and `screenshots\` stay next to the `.exe`
+
+## Support
+
+If you find this project useful:
+Buy me a coffee -> https://paypal.me/FerdinandusYudha
