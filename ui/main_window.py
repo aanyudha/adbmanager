@@ -1,10 +1,12 @@
 import os
 import time
+import html
 from pathlib import Path
 
 from PySide6.QtCore import QThread, Qt, QTimer, Signal
 from PySide6.QtGui import QColor
 from PySide6.QtWidgets import (
+    QAbstractItemView,
     QFileDialog,
     QHBoxLayout,
     QInputDialog,
@@ -24,14 +26,19 @@ from PySide6.QtWidgets import (
 from adb.device import AndroidDevice, list_devices
 from adb.manager import (
     adb_connect,
+    append_inspection_checkpoint,
+    append_inspection_event,
     adb_poweroff,
     adb_reboot,
     adb_screenshot,
+    get_boot_diagnostics,
     adb_send_notification,
     adb_shell,
     adb_vendor_settings_combo,
     adb_wake,
     auto_reconnect,
+    collect_device_inspection,
+    get_device_health_snapshot,
     get_all_device_status,
     get_device_status,
     launch_scrcpy,
@@ -42,12 +49,14 @@ from utils.paths import ensure_runtime_dir
 
 RAW_STATUS_ICONS = {
     "device": "[OK]",
+    "booting": "[BOOT]",
     "unauthorized": "[AUTH]",
     "offline": "[OFF]",
 }
 
 RAW_TO_UI_STATUS = {
     "device": "CONNECTED",
+    "booting": "BOOTING",
     "unauthorized": "UNAUTHORIZED",
     "offline": "OFFLINE",
 }
@@ -68,6 +77,11 @@ STATUS_THEME = {
         "fg": "#b45309",
         "bg": "#ffedd5",
     },
+    "BOOTING": {
+        "text": "[BOOT]",
+        "fg": "#1d4ed8",
+        "bg": "#dbeafe",
+    },
     "OS DOWN": {
         "text": "[DOWN]",
         "fg": "#991b1b",
@@ -75,14 +89,26 @@ STATUS_THEME = {
     },
 }
 
+ACTIVE_WATCHDOG_INTERVAL_MS = 1500
+BACKGROUND_STATUS_INTERVAL_SECONDS = 2
+SAVED_DEVICE_HEALTH_REFRESH_SECONDS = 15
+SCANNED_DEVICE_REFRESH_SECONDS = 10
+
 
 class StatusWorker(QThread):
     status_updated = Signal(dict)
 
-    def __init__(self, get_devices_callback, interval=3):
+    def __init__(
+        self,
+        get_devices_callback,
+        interval=BACKGROUND_STATUS_INTERVAL_SECONDS,
+        health_refresh_seconds=SAVED_DEVICE_HEALTH_REFRESH_SECONDS,
+    ):
         super().__init__()
         self.get_devices = get_devices_callback
         self.interval = interval
+        self.health_refresh_seconds = health_refresh_seconds
+        self.health_cache = {}
         self.running = True
 
     def run(self):
@@ -98,7 +124,38 @@ class StatusWorker(QThread):
                         saved_serials.append(f"{ip}:{port}")
 
                 status_map = get_all_device_status(refresh_serials=saved_serials)
-                self.status_updated.emit(status_map)
+                now = time.time()
+                active_serials = set(saved_serials)
+
+                for serial in list(self.health_cache):
+                    if serial not in active_serials:
+                        self.health_cache.pop(serial, None)
+
+                for serial in saved_serials:
+                    if status_map.get(serial) not in ("device", "booting"):
+                        continue
+
+                    cached = self.health_cache.get(serial)
+                    if cached and (now - cached.get("fetched_at", 0)) < self.health_refresh_seconds:
+                        continue
+
+                    snapshot = get_device_health_snapshot(serial)
+                    snapshot["fetched_at"] = now
+                    self.health_cache[serial] = snapshot
+
+                self.status_updated.emit(
+                    {
+                        "status_map": status_map,
+                        "health_map": {
+                            serial: {
+                                key: value
+                                for key, value in data.items()
+                                if key != "fetched_at"
+                            }
+                            for serial, data in self.health_cache.items()
+                        },
+                    }
+                )
 
             except Exception as e:
                 print("StatusWorker error:", e)
@@ -110,6 +167,21 @@ class StatusWorker(QThread):
 
     def stop(self):
         self.running = False
+
+
+class DeviceActionWorker(QThread):
+    result_ready = Signal(object)
+
+    def __init__(self, action):
+        super().__init__()
+        self.action = action
+
+    def run(self):
+        try:
+            result = self.action() or ""
+        except Exception as exc:
+            result = str(exc)
+        self.result_ready.emit(result)
 
 
 class MainWindow(QMainWindow):
@@ -124,6 +196,11 @@ class MainWindow(QMainWindow):
         self.last_active_status = None
         self.devices = []
         self.saved_devices = []
+        self.saved_device_health = {}
+        self.inspection_sessions = {}
+        self.inspection_worker = None
+        self.reboot_worker = None
+        self.last_background_scan_refresh_at = 0.0
 
         self.tabs = QTabWidget()
         self.tab_import = QWidget()
@@ -142,11 +219,12 @@ class MainWindow(QMainWindow):
 
         self.timer = QTimer()
         self.timer.timeout.connect(self.watchdog)
-        self.timer.start(3000)
+        self.timer.start(ACTIVE_WATCHDOG_INTERVAL_MS)
 
         self.status_worker = StatusWorker(
             get_devices_callback=lambda: self.saved_devices,
-            interval=3,
+            interval=BACKGROUND_STATUS_INTERVAL_SECONDS,
+            health_refresh_seconds=SAVED_DEVICE_HEALTH_REFRESH_SECONDS,
         )
         self.status_worker.status_updated.connect(self.update_saved_device_status)
         self.status_worker.start()
@@ -289,6 +367,7 @@ public_key=MIIBIjANBgkqhkiG9w0BAQEFAAOCAQ8ASAMPLEPUBLICKEY2
         self.power_btn = QPushButton("Power Off")
         self.scrcpy_btn = QPushButton("Scrcpy")
         self.shot_btn = QPushButton("Screenshot")
+        self.inspect_btn = QPushButton("Inspection")
         self.settings_btn = QPushButton("System Settings")
         self.vendor_btn = QPushButton("Vendor Settings")
         self.vendor_btn.clicked.connect(self.open_vendor_settings)
@@ -307,6 +386,13 @@ public_key=MIIBIjANBgkqhkiG9w0BAQEFAAOCAQ8ASAMPLEPUBLICKEY2
 
         self.info_box = QTextEdit()
         self.info_box.setReadOnly(True)
+        self.inspection_meta = QLabel("Inspection log belum ada. Pilih device lalu klik Inspection.")
+        self.inspection_meta.setWordWrap(True)
+        self.inspection_box = QTextEdit()
+        self.inspection_box.setReadOnly(True)
+        self.inspection_box.setPlaceholderText(
+            "Hasil inspection akan tampil di sini, termasuk warning listrik dan jaringan."
+        )
 
         self.status_label = QLabel("[OFF] No device selected")
         self.status_label.setWordWrap(True)
@@ -324,6 +410,7 @@ public_key=MIIBIjANBgkqhkiG9w0BAQEFAAOCAQ8ASAMPLEPUBLICKEY2
         action.addWidget(self.power_btn)
         action.addWidget(self.scrcpy_btn)
         action.addWidget(self.shot_btn)
+        action.addWidget(self.inspect_btn)
         action.addWidget(self.settings_btn)
         action.addWidget(self.vendor_btn)
 
@@ -351,7 +438,10 @@ public_key=MIIBIjANBgkqhkiG9w0BAQEFAAOCAQ8ASAMPLEPUBLICKEY2
         right.addWidget(QLabel("Manual ADB Command"))
         right.addLayout(cmd_bar)
         right.addWidget(QLabel("Device Info / Output"))
-        right.addWidget(self.info_box)
+        right.addWidget(self.info_box, 1)
+        right.addWidget(QLabel("Inspection Log"))
+        right.addWidget(self.inspection_meta)
+        right.addWidget(self.inspection_box, 1)
 
         main = QHBoxLayout()
         main.addLayout(left, 1)
@@ -370,6 +460,7 @@ public_key=MIIBIjANBgkqhkiG9w0BAQEFAAOCAQ8ASAMPLEPUBLICKEY2
         self.power_btn.clicked.connect(self.poweroff_device)
         self.scrcpy_btn.clicked.connect(self.scrcpy_device)
         self.shot_btn.clicked.connect(self.screenshot_device)
+        self.inspect_btn.clicked.connect(self.run_inspection)
         self.settings_btn.clicked.connect(self.open_settings)
         self.cmd_exec_btn.clicked.connect(self.run_manual_command)
         self.search_input.textChanged.connect(self.apply_device_filters)
@@ -379,12 +470,20 @@ public_key=MIIBIjANBgkqhkiG9w0BAQEFAAOCAQ8ASAMPLEPUBLICKEY2
             "QListWidget::item { padding: 6px 8px; border-radius: 6px; }"
             "QListWidget::item:selected { background: #dbeafe; color: #0f172a; }"
         )
+        self.device_list.setVerticalScrollMode(QAbstractItemView.ScrollPerPixel)
+        self.device_list.setUniformItemSizes(True)
         self.saved_list.setStyleSheet(
             "QListWidget::item { padding: 6px 8px; border-radius: 6px; }"
             "QListWidget::item:selected { background: #dbeafe; color: #0f172a; }"
         )
+        self.saved_list.setVerticalScrollMode(QAbstractItemView.ScrollPerPixel)
+        self.saved_list.setUniformItemSizes(True)
         self.status_label.setStyleSheet(
             "padding: 12px; border-radius: 10px; font-weight: 600;"
+        )
+        self.info_box.setStyleSheet("font-family: Consolas, 'Courier New', monospace;")
+        self.inspection_box.setStyleSheet(
+            "font-family: Consolas, 'Courier New', monospace;"
         )
 
     # ================= HELPERS =================
@@ -425,6 +524,174 @@ public_key=MIIBIjANBgkqhkiG9w0BAQEFAAOCAQ8ASAMPLEPUBLICKEY2
 
     def update_turn_on_button(self):
         self.turn_on_btn.setEnabled(bool(self.active_serial))
+        self.inspect_btn.setEnabled(bool(self.active_serial))
+
+    def get_inspection_session(self, serial=None):
+        target_serial = serial or self.active_serial
+        if not target_serial:
+            return None
+        return self.inspection_sessions.get(target_serial)
+
+    def render_inspection_session(self, serial=None):
+        session = self.get_inspection_session(serial)
+        if not session:
+            self.inspection_meta.setText(
+                "Inspection log belum ada. Klik Inspection untuk membaca kondisi device ini."
+            )
+            self.inspection_box.clear()
+            return
+
+        report = session.get("latest_report") or {}
+        log_path = Path(session["log_path"])
+        log_text = ""
+        if log_path.exists():
+            log_text = log_path.read_text(encoding="utf-8")
+
+        display_path = (
+            log_path.relative_to(Path.cwd())
+            if log_path.is_relative_to(Path.cwd())
+            else log_path
+        )
+        self.inspection_meta.setText(
+            f"Inspection monitor aktif: {display_path} | Last status: {session.get('last_logged_status', '-')}"
+        )
+        self.inspection_box.setHtml(
+            self.format_inspection_html(
+                report,
+                full_log_text=log_text,
+                monitor_active=True,
+                session=session,
+            )
+        )
+
+    def reset_inspection_view(self):
+        if self.active_serial and self.get_inspection_session(self.active_serial):
+            self.render_inspection_session(self.active_serial)
+            return
+
+        self.inspection_meta.setText(
+            "Inspection log belum ada. Klik Inspection untuk membaca kondisi device ini."
+        )
+        self.inspection_box.clear()
+
+    def remember_inspection_session(self, report):
+        electrical = report.get("hardware", {}).get("electrical", {})
+        storage_entries = report.get("hardware", {}).get("storage", [])
+        storage_text = report.get("hardware", {}).get("storage_summary", "-")
+        storage_percent = None
+        storage_mount = "-"
+        if storage_entries:
+            primary_storage = storage_entries[0]
+            for entry in storage_entries:
+                mount = entry.get("mount") or ""
+                if mount == "/data" or mount.startswith("/data/"):
+                    primary_storage = entry
+                    break
+            storage_mount = primary_storage.get("mount") or "-"
+            storage_percent = primary_storage.get("use_percent")
+            if storage_percent is not None:
+                storage_text = f"{storage_mount} {storage_percent}% used"
+
+        self.inspection_sessions[report["serial"]] = {
+            "log_path": report["log_path"],
+            "last_logged_status": report["status"],
+            "latest_report": report,
+            "stats": {
+                "voltage_min": electrical.get("voltage_volts"),
+                "voltage_max": electrical.get("voltage_volts"),
+                "temperature_min": electrical.get("temperature_c"),
+                "temperature_max": electrical.get("temperature_c"),
+            },
+        }
+        self.saved_device_health[report["serial"]] = {
+            "voltage_raw": electrical.get("voltage_raw"),
+            "voltage_volts": electrical.get("voltage_volts"),
+            "voltage_text": electrical.get("voltage_text", "-"),
+            "storage_mount": storage_mount,
+            "storage_percent": storage_percent,
+            "storage_text": storage_text,
+        }
+
+    def update_inspection_session_stats(self, session, report):
+        stats = session.setdefault(
+            "stats",
+            {
+                "voltage_min": None,
+                "voltage_max": None,
+                "temperature_min": None,
+                "temperature_max": None,
+            },
+        )
+        electrical = report.get("hardware", {}).get("electrical", {})
+
+        voltage = electrical.get("voltage_volts")
+        if voltage is not None:
+            if stats["voltage_min"] is None or voltage < stats["voltage_min"]:
+                stats["voltage_min"] = voltage
+            if stats["voltage_max"] is None or voltage > stats["voltage_max"]:
+                stats["voltage_max"] = voltage
+
+        temperature = electrical.get("temperature_c")
+        if temperature is not None:
+            if stats["temperature_min"] is None or temperature < stats["temperature_min"]:
+                stats["temperature_min"] = temperature
+            if stats["temperature_max"] is None or temperature > stats["temperature_max"]:
+                stats["temperature_max"] = temperature
+
+    def format_session_range(self, stats, prefix):
+        min_value = stats.get(f"{prefix}_min")
+        max_value = stats.get(f"{prefix}_max")
+        if min_value is None and max_value is None:
+            return "-"
+        if min_value is None:
+            return f"max {max_value:.2f}"
+        if max_value is None:
+            return f"min {min_value:.2f}"
+        return f"min {min_value:.2f} / max {max_value:.2f}"
+
+    def append_monitored_inspection_event(self, title, detail="", status="", serial=None):
+        target_serial = serial or self.active_serial
+        session = self.get_inspection_session(target_serial)
+        if not session or not target_serial:
+            return
+
+        append_inspection_event(
+            session["log_path"],
+            target_serial,
+            title,
+            detail=detail,
+            status=status or session.get("last_logged_status", ""),
+        )
+        if target_serial == self.active_serial:
+            self.render_inspection_session(target_serial)
+
+    def capture_monitored_inspection_checkpoint(
+        self,
+        reason,
+        status=None,
+        force=False,
+        serial=None,
+    ):
+        target_serial = serial or self.active_serial
+        session = self.get_inspection_session(target_serial)
+        if not session or not target_serial:
+            return
+
+        previous_status = session.get("last_logged_status")
+        if not force and status is not None and status == previous_status:
+            return
+
+        report = append_inspection_checkpoint(
+            session["log_path"],
+            target_serial,
+            reason,
+            previous_status=previous_status,
+        )
+        session["last_logged_status"] = report["status"]
+        session["latest_report"] = report
+        self.update_inspection_session_stats(session, report)
+        if target_serial == self.active_serial:
+            self.render_inspection_session(target_serial)
 
     def reset_search(self):
         if self.search_input.text():
@@ -441,6 +708,19 @@ public_key=MIIBIjANBgkqhkiG9w0BAQEFAAOCAQ8ASAMPLEPUBLICKEY2
         haystacks = [name.lower(), serial.lower()]
         return any(normalized_query in haystack for haystack in haystacks)
 
+    def get_saved_device_name(self, serial):
+        for device in self.saved_devices:
+            device_serial = self.make_serial(device["ip"], device.get("port"))
+            if device_serial == serial:
+                return device.get("name", "").strip()
+        return ""
+
+    def get_device_display_name(self, serial):
+        saved_name = self.get_saved_device_name(serial)
+        if saved_name:
+            return f"{saved_name} ({serial})"
+        return serial
+
     def make_scanned_item(self, device):
         item = QListWidgetItem(
             f"{self.raw_status_to_icon(device.status)} {device.serial} ({device.status})"
@@ -453,23 +733,48 @@ public_key=MIIBIjANBgkqhkiG9w0BAQEFAAOCAQ8ASAMPLEPUBLICKEY2
         )
         return item
 
-    def make_saved_item(self, device_data, raw_status):
+    def get_saved_item_text(self, device_data, raw_status):
         serial = self.make_serial(device_data["ip"], device_data.get("port"))
-        item = QListWidgetItem(
-            f"{self.raw_status_to_icon(raw_status)} {device_data['name']} ({serial})"
+        health = self.saved_device_health.get(serial, {})
+        voltage_text = health.get("voltage_text") or "-"
+        storage_text = health.get("storage_text") or "-"
+        return (
+            f"{self.raw_status_to_icon(raw_status)} {device_data['name']} ({serial})\n"
+            f"Volt: {voltage_text} | Storage: {storage_text}"
         )
+
+    def get_saved_item_tooltip(self, device_data, raw_status):
+        serial = self.make_serial(device_data["ip"], device_data.get("port"))
+        health = self.saved_device_health.get(serial, {})
+        voltage_text = health.get("voltage_text") or "-"
+        storage_text = health.get("storage_text") or "-"
+        return (
+            f"{device_data['name']} ({serial})\n"
+            f"Status: {self.raw_status_to_ui_status(raw_status)}\n"
+            f"Voltage: {voltage_text}\n"
+            f"Storage: {storage_text}"
+        )
+
+    def update_saved_item_widget(self, item, device_data, raw_status):
+        serial = self.make_serial(device_data["ip"], device_data.get("port"))
+        item.setText(self.get_saved_item_text(device_data, raw_status))
         item.setData(Qt.UserRole, serial)
         item.setData(Qt.UserRole + 1, raw_status)
         item.setData(Qt.UserRole + 2, device_data["name"])
+        item.setToolTip(self.get_saved_item_tooltip(device_data, raw_status))
         self.apply_status_style_to_item(
             item,
             self.raw_status_to_ui_status(raw_status),
         )
+
+    def make_saved_item(self, device_data, raw_status):
+        item = QListWidgetItem()
+        self.update_saved_item_widget(item, device_data, raw_status)
         return item
 
     def sync_active_device_state(self, status, refresh_info=False):
         if not self.active_serial:
-            return
+            return False
 
         status_changed = status != self.last_active_status
         self.last_active_status = status
@@ -478,34 +783,67 @@ public_key=MIIBIjANBgkqhkiG9w0BAQEFAAOCAQ8ASAMPLEPUBLICKEY2
         if refresh_info or status_changed:
             self.show_device_info_by_serial(self.active_serial, status=status)
 
-    def refresh_saved_list(self, status_map):
+        return status_changed
+
+    def refresh_saved_list(self, status_map, reload_devices=False):
         query = self.search_input.text().strip()
         selected_serial = self.get_item_serial(self.saved_list.currentItem())
         if not selected_serial and self.active_source == "saved":
             selected_serial = self.active_serial
 
-        self.saved_devices = load_devices()
+        if reload_devices:
+            self.saved_devices = load_devices()
 
-        self.saved_list.blockSignals(True)
-        self.saved_list.clear()
+        filtered_devices = []
+        desired_serials = []
 
-        selected_item = None
         for device in self.saved_devices:
             serial = self.make_serial(device["ip"], device.get("port"))
             if not self.matches_device_filter(query, device["name"], serial):
                 continue
+            filtered_devices.append(device)
+            desired_serials.append(serial)
 
-            raw_status = status_map.get(serial, "offline")
-            item = self.make_saved_item(device, raw_status)
-            self.saved_list.addItem(item)
+        current_serials = [
+            self.get_item_serial(self.saved_list.item(index))
+            for index in range(self.saved_list.count())
+        ]
 
-            if serial == selected_serial:
-                selected_item = item
+        self.saved_list.blockSignals(True)
+        self.saved_list.setUpdatesEnabled(False)
+        try:
+            if current_serials != desired_serials:
+                self.saved_list.clear()
 
-        if selected_item is not None:
-            self.saved_list.setCurrentItem(selected_item)
+                selected_item = None
+                for device in filtered_devices:
+                    serial = self.make_serial(device["ip"], device.get("port"))
+                    raw_status = status_map.get(serial, "offline")
+                    item = self.make_saved_item(device, raw_status)
+                    self.saved_list.addItem(item)
 
-        self.saved_list.blockSignals(False)
+                    if serial == selected_serial:
+                        selected_item = item
+
+                if selected_item is not None:
+                    self.saved_list.setCurrentItem(selected_item)
+            else:
+                for index, device in enumerate(filtered_devices):
+                    serial = desired_serials[index]
+                    raw_status = status_map.get(serial, "offline")
+                    item = self.saved_list.item(index)
+                    self.update_saved_item_widget(item, device, raw_status)
+
+                if selected_serial:
+                    for index, serial in enumerate(desired_serials):
+                        if serial == selected_serial:
+                            selected_item = self.saved_list.item(index)
+                            if selected_item is not self.saved_list.currentItem():
+                                self.saved_list.setCurrentItem(selected_item)
+                            break
+        finally:
+            self.saved_list.setUpdatesEnabled(True)
+            self.saved_list.blockSignals(False)
 
     # ================= CORE =================
 
@@ -521,6 +859,7 @@ public_key=MIIBIjANBgkqhkiG9w0BAQEFAAOCAQ8ASAMPLEPUBLICKEY2
         self.active_serial = self.make_serial(ip, port)
         self.active_source = "manual"
         self.update_turn_on_button()
+        self.reset_inspection_view()
 
         message = adb_connect(ip, port, timeout=5) or "No response from adb."
         QMessageBox.information(self, "ADB", message)
@@ -585,17 +924,24 @@ public_key=MIIBIjANBgkqhkiG9w0BAQEFAAOCAQ8ASAMPLEPUBLICKEY2
         if not serial:
             return
 
+        serial_changed = serial != self.active_serial
         self.active_serial = serial
         self.active_source = "scanned"
         self.update_turn_on_button()
+        if serial_changed:
+            self.reset_inspection_view()
 
         if ":" in serial:
             ip, port = serial.split(":", 1)
             self.ip_input.setText(ip)
             self.port_input.setText(port)
 
+        status = self.raw_status_to_ui_status(raw_status)
+        if raw_status == "device":
+            status = get_device_status(serial)
+
         self.sync_active_device_state(
-            self.raw_status_to_ui_status(raw_status),
+            status,
             refresh_info=True,
         )
 
@@ -604,9 +950,12 @@ public_key=MIIBIjANBgkqhkiG9w0BAQEFAAOCAQ8ASAMPLEPUBLICKEY2
         if not serial or ":" not in serial:
             return
 
+        serial_changed = serial != self.active_serial
         self.active_serial = serial
         self.active_source = "saved"
         self.update_turn_on_button()
+        if serial_changed:
+            self.reset_inspection_view()
 
         ip, port = serial.split(":", 1)
         self.ip_input.setText(ip)
@@ -619,6 +968,15 @@ public_key=MIIBIjANBgkqhkiG9w0BAQEFAAOCAQ8ASAMPLEPUBLICKEY2
         try:
             status = status or get_device_status(serial)
 
+            if status == "BOOTING":
+                self.info_box.setText(
+                    self.format_boot_diagnostics(
+                        serial,
+                        get_boot_diagnostics(serial),
+                    )
+                )
+                return
+
             if status != "CONNECTED":
                 self.info_box.setText(f"Device not ready\n\nStatus: {status}")
                 return
@@ -628,6 +986,31 @@ public_key=MIIBIjANBgkqhkiG9w0BAQEFAAOCAQ8ASAMPLEPUBLICKEY2
 
         except Exception as e:
             self.info_box.setText(f"Failed to read device info\n\n{e}")
+
+    def format_boot_diagnostics(self, serial, diagnostics):
+        foreground = diagnostics.get("foreground_activity") or "-"
+        boot_completed = diagnostics.get("sys.boot_completed") or "(empty)"
+        dev_bootcomplete = diagnostics.get("dev.bootcomplete") or "(empty)"
+        bootanim = diagnostics.get("init.svc.bootanim") or "(empty)"
+
+        return f"""
+BOOT DIAGNOSTICS
+----------------
+Serial         : {serial}
+Status         : BOOTING
+sys.boot_completed : {boot_completed}
+dev.bootcomplete   : {dev_bootcomplete}
+init.svc.bootanim  : {bootanim}
+
+Foreground Activity
+-------------------
+{foreground}
+
+Notes
+-----
+ADB is reachable, but Android boot is not marked complete yet.
+If this state stays for a long time, the device may be stuck on the Google logo or app splash screen.
+""".strip()
 
     def format_device_info(self, info):
         return f"""
@@ -664,9 +1047,8 @@ ABI List       : {info['abi_list']}
     # ================= SAVED DEVICE =================
 
     def load_saved_devices(self):
-        self.saved_devices = load_devices()
         status_map = get_all_device_status()
-        self.refresh_saved_list(status_map)
+        self.refresh_saved_list(status_map, reload_devices=True)
 
     def save_current_device(self):
         if not self.active_serial:
@@ -684,9 +1066,16 @@ ABI List       : {info['abi_list']}
             add_device(name.strip(), ip, port)
             self.load_saved_devices()
 
-    def update_saved_device_status(self, status_map):
+    def update_saved_device_status(self, payload):
+        status_map = payload.get("status_map", {}) if isinstance(payload, dict) else payload
+        health_map = payload.get("health_map", {}) if isinstance(payload, dict) else {}
+        if health_map:
+            self.saved_device_health.update(health_map)
         self.refresh_saved_list(status_map)
-        self.scan_devices()
+        now = time.time()
+        if now - self.last_background_scan_refresh_at >= SCANNED_DEVICE_REFRESH_SECONDS:
+            self.scan_devices()
+            self.last_background_scan_refresh_at = now
 
         if self.active_source == "saved" and self.active_serial:
             raw_status = status_map.get(self.active_serial, "offline")
@@ -699,13 +1088,96 @@ ABI List       : {info['abi_list']}
         if hasattr(self, "status_worker"):
             self.status_worker.stop()
             self.status_worker.wait(2000)
+        for worker in [self.inspection_worker, self.reboot_worker]:
+            if worker and worker.isRunning():
+                worker.wait(2000)
         event.accept()
 
     # ================= ACTIONS =================
 
     def reboot_device(self):
-        if self.active_serial:
-            adb_reboot(self.active_serial)
+        if not self.active_serial:
+            QMessageBox.warning(self, "Restart OS", "No device selected")
+            return
+
+        if self.reboot_worker and self.reboot_worker.isRunning():
+            QMessageBox.information(
+                self,
+                "Restart OS",
+                "Restart OS untuk device yang dipilih masih sedang diproses.",
+            )
+            return
+
+        device_label = self.get_device_display_name(self.active_serial)
+        reply = QMessageBox.question(
+            self,
+            "Confirm Restart OS",
+            (
+                "Device yang akan di-restart:\n\n"
+                f"{device_label}\n\n"
+                "Lanjutkan restart OS?"
+            ),
+            QMessageBox.Yes | QMessageBox.No,
+            QMessageBox.No,
+        )
+
+        if reply != QMessageBox.Yes:
+            return
+
+        target_serial = self.active_serial
+        target_label = device_label
+
+        self.timer.stop()
+        self.reboot_btn.setEnabled(False)
+        self.status_label.setText(
+            f"[BOOT] {target_serial}\n\n"
+            "Restart command is being sent...\n"
+            "Mohon tunggu, status device akan diperbarui otomatis."
+        )
+        self.info_box.setText(
+            "Restart OS sedang dikirim.\n\n"
+            f"Target device : {target_label}\n"
+            "UI tetap aktif. Monitor akan lanjut membaca perubahan status setelah reboot mulai berjalan."
+        )
+
+        self.reboot_worker = DeviceActionWorker(
+            lambda: adb_reboot(target_serial) or "Reboot command sent."
+        )
+        self.reboot_worker.result_ready.connect(
+            lambda message, serial=target_serial, label=target_label: self.on_reboot_finished(
+                serial,
+                label,
+                message,
+            )
+        )
+        self.reboot_worker.start()
+
+    def on_reboot_finished(self, serial, device_label, message):
+        self.append_monitored_inspection_event(
+            "Restart OS command sent",
+            f"ADB reboot command dikirim dari aplikasi untuk {device_label}. Monitor akan terus mencatat perubahan status sesudah ini.",
+            status=self.last_active_status or "CONNECTED",
+            serial=serial,
+        )
+
+        if serial == self.active_serial:
+            self.sync_active_device_state("BOOTING", refresh_info=False)
+            self.info_box.setText(
+                "Restart OS command sent.\n\n"
+                f"Target device : {device_label}\n"
+                "ADB biasanya akan terputus sebentar saat reboot dimulai.\n"
+                "Status akan diperbarui otomatis oleh watchdog."
+            )
+
+        self.reboot_btn.setEnabled(True)
+        self.reboot_worker = None
+        QTimer.singleShot(ACTIVE_WATCHDOG_INTERVAL_MS, self.watchdog)
+        self.timer.start(ACTIVE_WATCHDOG_INTERVAL_MS)
+        QMessageBox.information(
+            self,
+            "Restart OS",
+            f"Target device:\n{device_label}\n\n{message or 'Reboot command sent.'}",
+        )
 
     def turn_on_device(self):
         if not self.active_serial:
@@ -753,6 +1225,11 @@ ABI List       : {info['abi_list']}
 
         if reply == QMessageBox.Yes:
             adb_poweroff(self.active_serial)
+            self.append_monitored_inspection_event(
+                "Power Off command sent",
+                "ADB power off command dikirim dari aplikasi.",
+                status=self.last_active_status or "CONNECTED",
+            )
 
     def scrcpy_device(self):
         if not self.active_serial:
@@ -760,7 +1237,7 @@ ABI List       : {info['abi_list']}
 
         self.timer.stop()
         launch_scrcpy(self.active_serial)
-        self.timer.start(5000)
+        self.timer.start(ACTIVE_WATCHDOG_INTERVAL_MS)
 
     def screenshot_device(self):
         if not self.active_serial:
@@ -796,6 +1273,178 @@ ABI List       : {info['abi_list']}
         output = adb_shell(self.active_serial, command)
         self.info_box.setText(output)
 
+    def format_inspection_html(self, report, full_log_text="", monitor_active=False, session=None):
+        level_theme = {
+            "HIGH": {"bg": "#fee2e2", "fg": "#991b1b"},
+            "MEDIUM": {"bg": "#ffedd5", "fg": "#9a3412"},
+            "LOW": {"bg": "#ecfccb", "fg": "#3f6212"},
+        }
+        hardware = report.get("hardware", {})
+        electrical = hardware.get("electrical", {})
+        memory = hardware.get("memory", {})
+        storage_entries = hardware.get("storage", [])
+        session_stats = (session or {}).get("stats", {})
+
+        voltage_range = self.format_session_range(session_stats, "voltage")
+        temperature_range = self.format_session_range(session_stats, "temperature")
+        voltage_range_text = (
+            f"{voltage_range} V"
+            if voltage_range != "-"
+            else "-"
+        )
+        temperature_range_text = (
+            f"{temperature_range} C"
+            if temperature_range != "-"
+            else "-"
+        )
+
+        parts = [
+            "<div style='font-family: Segoe UI, Arial, sans-serif;'>",
+            "<h3 style='margin-bottom: 6px;'>Inspection Summary</h3>",
+            (
+                "<div style='margin: 0 0 10px 0; padding: 8px 10px; border-radius: 8px; "
+                f"background: {'#dbeafe' if monitor_active else '#f3f4f6'}; color: #1e3a8a;'>"
+                f"<b>Monitor:</b> {'ACTIVE' if monitor_active else 'Snapshot only'}"
+                "</div>"
+            ),
+            (
+                "<p style='margin-top: 0;'>"
+                f"<b>Serial:</b> {html.escape(report['serial'])}<br>"
+                f"<b>Status:</b> {html.escape(report['status'])}<br>"
+                f"<b>ADB Transport:</b> {html.escape(report['adb_state'] or '-')}<br>"
+                f"<b>Host Ping:</b> {html.escape(report['summary'].get('host_ping', '-'))}<br>"
+                f"<b>Device IP(s):</b> {html.escape(report['summary'].get('device_ips', '-'))}<br>"
+                f"<b>Battery:</b> {html.escape(report['summary'].get('battery', '-'))}<br>"
+                f"<b>Power State:</b> {html.escape(report['summary'].get('power', '-'))}<br>"
+                f"<b>Electrical:</b> {html.escape(report['summary'].get('electrical', '-'))}<br>"
+                f"<b>Memory:</b> {html.escape(report['summary'].get('memory', '-'))}<br>"
+                f"<b>Storage:</b> {html.escape(report['summary'].get('storage', '-'))}<br>"
+                f"<b>Uptime:</b> {html.escape(report['summary'].get('uptime', '-'))}<br>"
+                f"<b>Boot Reason:</b> {html.escape(report['summary'].get('boot_reason', '-'))}"
+                "</p>"
+            ),
+        ]
+
+        parts.append(
+            "<div style='margin: 8px 0; padding: 10px 12px; border-radius: 8px; background: #f8fafc; color: #0f172a;'>"
+            "<b>Electrical Detail</b><br>"
+            f"Voltage sekarang: {html.escape(electrical.get('voltage_text', '-'))}<br>"
+            f"Voltage monitor: {html.escape(voltage_range_text)}<br>"
+            f"Temperature sekarang: {html.escape(electrical.get('temperature_text', '-'))}<br>"
+            f"Temperature monitor: {html.escape(temperature_range_text)}<br>"
+            f"Sumber daya: {html.escape(electrical.get('source_text', '-'))}"
+            "</div>"
+        )
+
+        parts.append(
+            "<div style='margin: 8px 0; padding: 10px 12px; border-radius: 8px; background: #f8fafc; color: #0f172a;'>"
+            "<b>Hardware Health</b><br>"
+            f"Memory: {html.escape(memory.get('summary', '-'))}<br>"
+            f"Storage: {html.escape(hardware.get('storage_summary', '-'))}<br>"
+            f"Uptime: {html.escape(hardware.get('uptime_text', '-'))}<br>"
+            f"Boot reason: {html.escape(hardware.get('boot_reason', '-'))}"
+            "</div>"
+        )
+
+        if storage_entries:
+            storage_lines = []
+            for entry in storage_entries:
+                use_percent = entry.get("use_percent")
+                use_text = f"{use_percent}%" if use_percent is not None else "-"
+                storage_lines.append(
+                    f"{entry['mount']}: {use_text} used, free {entry['available_kb'] / 1024:.1f} MB"
+                )
+            parts.append(
+                "<div style='margin: 8px 0; padding: 10px 12px; border-radius: 8px; background: #f8fafc; color: #0f172a;'>"
+                "<b>Storage Detail</b><br>"
+                + "<br>".join(html.escape(line) for line in storage_lines)
+                + "</div>"
+            )
+
+        if report["alerts"]:
+            for alert in report["alerts"]:
+                theme = level_theme.get(alert["level"], level_theme["LOW"])
+                parts.append(
+                    "<div style='margin: 8px 0; padding: 10px 12px; border-radius: 8px; "
+                    f"background: {theme['bg']}; color: {theme['fg']};'>"
+                    f"<b>[{html.escape(alert['level'])}] {html.escape(alert['category'])}</b><br>"
+                    f"<b>{html.escape(alert['title'])}</b><br>"
+                    f"{html.escape(alert['detail'])}"
+                    "</div>"
+                )
+        else:
+            parts.append(
+                "<div style='margin: 8px 0; padding: 10px 12px; border-radius: 8px; "
+                "background: #dcfce7; color: #166534;'>"
+                "<b>[OK]</b> Tidak ada indikasi kritis dari inspection ini."
+                "</div>"
+            )
+
+        parts.append("<h4 style='margin-bottom: 6px;'>Full Log</h4>")
+        parts.append(
+            "<pre style='white-space: pre-wrap; font-family: Consolas, "
+            "\"Courier New\", monospace; font-size: 12px; line-height: 1.4;'>"
+            f"{html.escape(full_log_text or report.get('log_text', ''))}</pre>"
+        )
+        parts.append("</div>")
+        return "".join(parts)
+
+    def run_inspection(self):
+        if not self.active_serial:
+            QMessageBox.warning(self, "Inspection", "No active device selected.")
+            return
+
+        if self.inspection_worker and self.inspection_worker.isRunning():
+            QMessageBox.information(
+                self,
+                "Inspection",
+                "Inspection untuk device yang dipilih masih sedang berjalan.",
+            )
+            return
+
+        target_serial = self.active_serial
+        target_label = self.get_device_display_name(target_serial)
+
+        self.inspection_meta.setText("Inspection sedang berjalan...")
+        self.inspection_box.setHtml(
+            (
+                "<p style='font-family: Segoe UI, Arial, sans-serif;'>"
+                f"Inspection berjalan di background untuk <b>{html.escape(target_label)}</b>.<br>"
+                "Mengambil log device, power, network, dan hardware health..."
+                "</p>"
+            )
+        )
+        self.inspect_btn.setEnabled(False)
+
+        self.inspection_worker = DeviceActionWorker(
+            lambda: collect_device_inspection(target_serial)
+        )
+        self.inspection_worker.result_ready.connect(
+            lambda result, serial=target_serial: self.on_inspection_finished(
+                serial,
+                result,
+            )
+        )
+        self.inspection_worker.start()
+
+    def on_inspection_finished(self, serial, result):
+        self.inspection_worker = None
+        self.inspect_btn.setEnabled(bool(self.active_serial))
+
+        if not isinstance(result, dict):
+            if serial == self.active_serial:
+                self.inspection_meta.setText("Inspection gagal dibuat.")
+                self.inspection_box.setPlainText(
+                    f"Failed to inspect device\n\n{result}"
+                )
+            return
+
+        self.remember_inspection_session(result)
+        self.refresh_saved_list(get_all_device_status())
+
+        if serial == self.active_serial:
+            self.render_inspection_session(serial)
+
     def update_ui_by_status(self, status):
         serial_text = self.active_serial or "-"
         theme = self.get_status_theme(status)
@@ -828,6 +1477,18 @@ ABI List       : {info['abi_list']}
             )
             self.set_controls_enabled(False)
 
+        elif status == "BOOTING":
+            self.status_label.setText(
+                f"{prefix} {serial_text}\n\n"
+                "ADB is reachable but boot is not complete yet.\n"
+                "If this stays too long, the device may be stuck on the Google logo."
+            )
+            self.set_controls_enabled(False)
+            self.reboot_btn.setEnabled(True)
+            self.scrcpy_btn.setEnabled(True)
+            self.shot_btn.setEnabled(True)
+            self.cmd_exec_btn.setEnabled(True)
+
         else:
             self.status_label.setText(
                 f"{prefix} {serial_text}\n\nOS down / not reachable."
@@ -837,21 +1498,43 @@ ABI List       : {info['abi_list']}
     # ================= WATCHDOG =================
 
     def watchdog(self):
-        if not self.active_serial:
-            return
+        active_status = None
 
-        status = get_device_status(self.active_serial)
-        self.sync_active_device_state(status, refresh_info=False)
-
-        if status == "UNAUTHORIZED":
-            adb_send_notification(
-                self.active_serial,
-                "ADB Authorization",
-                "Allow USB debugging using your remote",
+        if self.active_serial:
+            active_status = get_device_status(self.active_serial)
+            status_changed = self.sync_active_device_state(
+                active_status,
+                refresh_info=False,
             )
 
-        elif status in ("OFFLINE", "OS DOWN"):
-            ip = self.ip_input.text().strip()
-            port = self.normalize_port(self.port_input.text())
-            if ip:
-                auto_reconnect(self.active_serial, ip, port)
+            if status_changed:
+                self.capture_monitored_inspection_checkpoint(
+                    "Status change detected by watchdog",
+                    status=active_status,
+                    serial=self.active_serial,
+                )
+
+            if active_status == "UNAUTHORIZED":
+                adb_send_notification(
+                    self.active_serial,
+                    "ADB Authorization",
+                    "Allow USB debugging using your remote",
+                )
+
+            elif active_status in ("OFFLINE", "OS DOWN"):
+                ip = self.ip_input.text().strip()
+                port = self.normalize_port(self.port_input.text())
+                if ip:
+                    auto_reconnect(self.active_serial, ip, port)
+
+        for serial, session in list(self.inspection_sessions.items()):
+            if serial == self.active_serial:
+                continue
+
+            status = get_device_status(serial)
+            if status != session.get("last_logged_status"):
+                self.capture_monitored_inspection_checkpoint(
+                    "Status change detected by background monitor",
+                    status=status,
+                    serial=serial,
+                )

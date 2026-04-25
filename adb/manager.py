@@ -1,9 +1,12 @@
+import re
 import shlex
 import subprocess
 import time
+from datetime import datetime
+from pathlib import Path
 
 from utils.logger import log_error
-from utils.paths import get_bundle_root
+from utils.paths import ensure_runtime_dir, get_bundle_root
 
 
 # =========================================================
@@ -21,7 +24,7 @@ def _normalize_args(args):
     return list(args)
 
 
-def run_adb(args, timeout=15) -> str:
+def run_adb(args, timeout=15, log_timeout=True) -> str:
     try:
         result = subprocess.run(
             [str(ADB_EXE)] + _normalize_args(args),
@@ -42,7 +45,8 @@ def run_adb(args, timeout=15) -> str:
 
     except subprocess.TimeoutExpired:
         message = f"adb command timed out after {timeout}s"
-        log_error(message)
+        if log_timeout:
+            log_error(message)
         return message
 
     except Exception as e:
@@ -50,12 +54,41 @@ def run_adb(args, timeout=15) -> str:
         return str(e)
 
 
+def run_host_command(args, timeout=8) -> str:
+    try:
+        result = subprocess.run(
+            list(args),
+            capture_output=True,
+            text=True,
+            timeout=timeout,
+            check=False,
+        )
+
+        stdout = result.stdout.strip()
+        stderr = result.stderr.strip()
+        output = "\n".join(part for part in (stdout, stderr) if part).strip()
+
+        if not output and result.returncode != 0:
+            output = f"command exited with code {result.returncode}"
+
+        return output
+
+    except subprocess.TimeoutExpired:
+        return f"command timed out after {timeout}s"
+    except Exception as e:
+        return str(e)
+
+
 # =========================================================
 # BASIC COMMANDS
 # =========================================================
 
-def adb_connect(ip: str, port: str, timeout=3) -> str:
-    return run_adb(["connect", f"{ip}:{port}"], timeout=timeout)
+def adb_connect(ip: str, port: str, timeout=3, log_timeout=True) -> str:
+    return run_adb(
+        ["connect", f"{ip}:{port}"],
+        timeout=timeout,
+        log_timeout=log_timeout,
+    )
 
 
 def adb_reboot(serial: str) -> str:
@@ -121,11 +154,100 @@ def connect_device(serial):
     return run_adb(["connect", serial], timeout=3)
 
 
+def get_boot_markers(serial: str):
+    output = run_adb(
+        [
+            "-s",
+            serial,
+            "shell",
+            "sh",
+            "-c",
+            (
+                "printf 'sys.boot_completed='; getprop sys.boot_completed; "
+                "printf '\\ndev.bootcomplete='; getprop dev.bootcomplete; "
+                "printf '\\ninit.svc.bootanim='; getprop init.svc.bootanim"
+            ),
+        ],
+        timeout=6,
+    )
+
+    markers = {
+        "sys.boot_completed": "",
+        "dev.bootcomplete": "",
+        "init.svc.bootanim": "",
+    }
+
+    for line in output.splitlines():
+        if "=" not in line:
+            continue
+        key, value = line.split("=", 1)
+        key = key.strip()
+        if key in markers:
+            markers[key] = value.strip()
+
+    return markers
+
+
+def get_foreground_activity(serial: str) -> str:
+    output = run_adb(
+        ["-s", serial, "shell", "dumpsys", "activity", "activities"],
+        timeout=4,
+    )
+
+    for line in output.splitlines():
+        stripped = line.strip()
+        if "mResumedActivity:" in stripped or stripped.startswith("ResumedActivity:"):
+            return stripped
+
+    return ""
+
+
+def get_boot_diagnostics(serial: str, include_foreground: bool = True):
+    markers = get_boot_markers(serial)
+    return {
+        **markers,
+        "foreground_activity": (
+            get_foreground_activity(serial) if include_foreground else ""
+        ),
+    }
+
+
+def is_ready_foreground_activity(activity: str) -> bool:
+    activity = (activity or "").lower()
+    return "com.masi.iptv/.ui.core.activity.mainactivity" in activity
+
+
+def classify_device_transport_status(serial: str, transport_status: str) -> str:
+    if transport_status != "device":
+        return transport_status
+
+    markers = get_boot_markers(serial)
+    boot_completed = (
+        markers["sys.boot_completed"] == "1"
+        or markers["dev.bootcomplete"] == "1"
+    )
+    bootanim_running = markers["init.svc.bootanim"] == "running"
+
+    if bootanim_running:
+        return "booting"
+
+    if boot_completed:
+        return transport_status
+
+    foreground_ready = is_ready_foreground_activity(
+        get_foreground_activity(serial)
+    )
+    if not foreground_ready:
+        return "booting"
+
+    return transport_status
+
+
 def get_all_device_status(refresh_serials=None):
     refresh_serials = refresh_serials or []
 
     for serial in refresh_serials:
-        run_adb(["connect", serial], timeout=2)
+        run_adb(["connect", serial], timeout=2, log_timeout=False)
 
     # Warm-up call to let adb refresh its internal device list.
     run_adb(["devices"])
@@ -145,15 +267,22 @@ def get_all_device_status(refresh_serials=None):
             status = parts[1]
             status_map[serial] = status
 
+    for serial in refresh_serials:
+        raw_status = status_map.get(serial)
+        if raw_status == "device":
+            status_map[serial] = classify_device_transport_status(serial, raw_status)
+
     return status_map
 
 
 def get_device_status(serial: str) -> str:
-    status_map = get_all_device_status()
+    status_map = get_all_device_status(refresh_serials=[serial])
     status = status_map.get(serial)
 
     if status == "device":
         return "CONNECTED"
+    if status == "booting":
+        return "BOOTING"
     if status == "unauthorized":
         return "UNAUTHORIZED"
     if status == "offline":
@@ -163,7 +292,7 @@ def get_device_status(serial: str) -> str:
 
 def auto_reconnect(serial, ip, port):
     if get_device_status(serial) != "CONNECTED":
-        adb_connect(ip, port, timeout=2)
+        adb_connect(ip, port, timeout=2, log_timeout=False)
         time.sleep(1)
 
 
@@ -191,3 +320,1045 @@ def adb_send_notification(serial: str, title: str, text: str):
         "cmd", "notification", "post",
         "adbtool", title, text
     ])
+
+
+def _parse_key_value_output(output: str):
+    values = {}
+
+    for line in output.splitlines():
+        separator = None
+        if "=" in line:
+            separator = "="
+        elif ":" in line:
+            separator = ":"
+
+        if separator is None:
+            continue
+
+        key, value = line.split(separator, 1)
+        values[key.strip().lower()] = value.strip()
+
+    return values
+
+
+def _parse_ping_summary(output: str):
+    summary = {
+        "sent": None,
+        "received": None,
+        "lost": None,
+        "loss_percent": None,
+        "average_ms": None,
+    }
+
+    packet_match = re.search(
+        r"Sent = (\d+), Received = (\d+), Lost = (\d+) \((\d+)% loss\)",
+        output,
+        re.IGNORECASE,
+    )
+    if packet_match:
+        summary["sent"] = int(packet_match.group(1))
+        summary["received"] = int(packet_match.group(2))
+        summary["lost"] = int(packet_match.group(3))
+        summary["loss_percent"] = int(packet_match.group(4))
+
+    average_match = re.search(r"Average = (\d+)ms", output, re.IGNORECASE)
+    if average_match:
+        summary["average_ms"] = int(average_match.group(1))
+
+    return summary
+
+
+def _parse_battery_summary(output: str):
+    values = _parse_key_value_output(output)
+
+    def parse_int(name):
+        raw_value = values.get(name)
+        if raw_value is None:
+            return None
+        try:
+            return int(raw_value)
+        except ValueError:
+            return None
+
+    def parse_bool(name):
+        raw_value = values.get(name)
+        if raw_value is None:
+            return None
+        return raw_value.lower() == "true"
+
+    return {
+        "ac_powered": parse_bool("ac powered"),
+        "usb_powered": parse_bool("usb powered"),
+        "wireless_powered": parse_bool("wireless powered"),
+        "dock_powered": parse_bool("dock powered"),
+        "present": parse_bool("present"),
+        "level": parse_int("level"),
+        "scale": parse_int("scale"),
+        "status": values.get("status"),
+        "health": values.get("health"),
+        "voltage": parse_int("voltage"),
+        "temperature": parse_int("temperature"),
+    }
+
+
+def _parse_uptime_seconds(output: str):
+    first_line = (output or "").strip().splitlines()
+    if not first_line:
+        return None
+
+    parts = first_line[0].split()
+    if not parts:
+        return None
+
+    try:
+        return float(parts[0])
+    except ValueError:
+        return None
+
+
+def _format_duration(seconds):
+    if seconds is None:
+        return "-"
+
+    total_seconds = int(seconds)
+    days, remainder = divmod(total_seconds, 86400)
+    hours, remainder = divmod(remainder, 3600)
+    minutes, secs = divmod(remainder, 60)
+
+    parts = []
+    if days:
+        parts.append(f"{days}d")
+    if hours or parts:
+        parts.append(f"{hours}h")
+    if minutes or parts:
+        parts.append(f"{minutes}m")
+    parts.append(f"{secs}s")
+    return " ".join(parts)
+
+
+def _format_kb(kb_value):
+    if kb_value is None:
+        return "-"
+
+    size = float(kb_value)
+    units = ["KB", "MB", "GB", "TB"]
+    unit_index = 0
+
+    while size >= 1024 and unit_index < len(units) - 1:
+        size /= 1024
+        unit_index += 1
+
+    return f"{size:.1f} {units[unit_index]}"
+
+
+def _normalize_voltage(raw_value):
+    if raw_value is None or raw_value <= 0:
+        return None
+
+    if raw_value >= 1000:
+        return raw_value / 1000.0
+
+    if raw_value < 10:
+        return float(raw_value)
+
+    return raw_value / 1000.0
+
+
+def _format_voltage(raw_value):
+    volts = _normalize_voltage(raw_value)
+    if volts is None:
+        return "-"
+
+    if raw_value is not None and raw_value < 10:
+        return f"{volts:.2f} V (device-reported)"
+
+    return f"{volts:.2f} V ({raw_value} mV)"
+
+
+def _normalize_temperature(raw_value):
+    if raw_value is None:
+        return None
+
+    if raw_value >= 200:
+        return raw_value / 10.0
+
+    return float(raw_value)
+
+
+def _format_temperature(raw_value):
+    celsius = _normalize_temperature(raw_value)
+    if celsius is None:
+        return "-"
+    return f"{celsius:.1f} C"
+
+
+def _parse_meminfo(output: str):
+    values = {}
+
+    for line in output.splitlines():
+        if ":" not in line:
+            continue
+        key, value = line.split(":", 1)
+        parts = value.strip().split()
+        if not parts:
+            continue
+        try:
+            values[key.strip()] = int(parts[0])
+        except ValueError:
+            continue
+
+    total_kb = values.get("MemTotal")
+    available_kb = values.get("MemAvailable", values.get("MemFree"))
+    used_kb = None
+    used_percent = None
+    available_percent = None
+
+    if total_kb is not None and available_kb is not None:
+        used_kb = max(total_kb - available_kb, 0)
+        used_percent = (used_kb / total_kb) * 100 if total_kb else None
+        available_percent = (available_kb / total_kb) * 100 if total_kb else None
+
+    return {
+        "total_kb": total_kb,
+        "available_kb": available_kb,
+        "used_kb": used_kb,
+        "used_percent": used_percent,
+        "available_percent": available_percent,
+    }
+
+
+def _parse_df_output(output: str):
+    entries = []
+    preferred_mounts = ["/data", "/sdcard", "/storage/emulated", "/mnt/media_rw"]
+
+    for line in output.splitlines():
+        stripped = line.strip()
+        if not stripped or stripped.lower().startswith("filesystem"):
+            continue
+
+        parts = stripped.split()
+        if len(parts) < 4:
+            continue
+
+        mount = parts[-1]
+        use_percent = None
+        use_token = None
+        numeric_tokens = []
+
+        for token in parts[1:]:
+            if token.endswith("%") and token[:-1].isdigit():
+                use_token = int(token[:-1])
+                continue
+
+            cleaned = token.strip("%")
+            if cleaned.isdigit():
+                numeric_tokens.append(int(cleaned))
+
+        if use_token is not None:
+            use_percent = use_token
+
+        if len(numeric_tokens) < 3:
+            continue
+
+        total_kb = numeric_tokens[0]
+        used_kb = numeric_tokens[1]
+        available_kb = numeric_tokens[2]
+
+        if use_percent is None and total_kb:
+            use_percent = int((used_kb / total_kb) * 100)
+
+        entries.append(
+            {
+                "mount": mount,
+                "total_kb": total_kb,
+                "used_kb": used_kb,
+                "available_kb": available_kb,
+                "use_percent": use_percent,
+            }
+        )
+
+    preferred_entries = []
+    for preferred_mount in preferred_mounts:
+        for entry in entries:
+            if entry["mount"] == preferred_mount or entry["mount"].startswith(
+                preferred_mount + "/"
+            ):
+                preferred_entries.append(entry)
+
+    deduped = []
+    seen_mounts = set()
+    for entry in preferred_entries + entries:
+        mount = entry["mount"]
+        if mount in seen_mounts:
+            continue
+        seen_mounts.add(mount)
+        deduped.append(entry)
+
+    return deduped[:5]
+
+
+def _extract_interface_ips(output: str):
+    addresses = []
+
+    for line in output.splitlines():
+        stripped = line.strip()
+        if not stripped.startswith("inet "):
+            continue
+
+        parts = stripped.split()
+        if len(parts) >= 2:
+            addresses.append(parts[1].split("/", 1)[0])
+
+    return addresses
+
+
+def _extract_power_markers(output: str):
+    markers = {
+        "wakefulness": "",
+        "display_state": "",
+    }
+
+    wakefulness_match = re.search(r"mWakefulness=([A-Za-z]+)", output)
+    if wakefulness_match:
+        markers["wakefulness"] = wakefulness_match.group(1)
+
+    display_match = re.search(r"Display Power: state=([A-Za-z]+)", output)
+    if display_match:
+        markers["display_state"] = display_match.group(1)
+
+    return markers
+
+
+def _make_alert(level: str, category: str, title: str, detail: str):
+    return {
+        "level": level,
+        "category": category,
+        "title": title,
+        "detail": detail,
+    }
+
+
+def _build_storage_summary(storage_entries):
+    if not storage_entries:
+        return "-"
+
+    parts = []
+    for entry in storage_entries[:3]:
+        use_percent = (
+            f"{entry['use_percent']}%"
+            if entry.get("use_percent") is not None
+            else "?"
+        )
+        parts.append(f"{entry['mount']} {use_percent} used")
+
+    return ", ".join(parts)
+
+
+def _pick_primary_storage_entry(storage_entries):
+    if not storage_entries:
+        return None
+
+    for preferred_mount in ["/data", "/sdcard", "/storage/emulated"]:
+        for entry in storage_entries:
+            mount = entry.get("mount") or ""
+            if mount == preferred_mount or mount.startswith(preferred_mount + "/"):
+                return entry
+
+    return storage_entries[0]
+
+
+def get_device_health_snapshot(serial: str):
+    battery_output = run_adb(
+        ["-s", serial, "shell", "dumpsys", "battery"],
+        timeout=4,
+        log_timeout=False,
+    )
+    storage_output = run_adb(
+        ["-s", serial, "shell", "df"],
+        timeout=4,
+        log_timeout=False,
+    )
+
+    battery = _parse_battery_summary(battery_output) if battery_output else {}
+    storage_entries = _parse_df_output(storage_output) if storage_output else []
+    primary_storage = _pick_primary_storage_entry(storage_entries)
+
+    voltage_raw = battery.get("voltage") if battery else None
+    voltage_volts = _normalize_voltage(voltage_raw)
+    voltage_text = _format_voltage(voltage_raw)
+
+    storage_mount = primary_storage.get("mount") if primary_storage else "-"
+    storage_percent = (
+        primary_storage.get("use_percent")
+        if primary_storage
+        else None
+    )
+    if primary_storage and storage_percent is not None:
+        storage_text = f"{storage_mount} {storage_percent}% used"
+    elif primary_storage:
+        storage_text = storage_mount
+    else:
+        storage_text = "-"
+
+    return {
+        "voltage_raw": voltage_raw,
+        "voltage_volts": voltage_volts,
+        "voltage_text": voltage_text,
+        "storage_mount": storage_mount,
+        "storage_percent": storage_percent,
+        "storage_text": storage_text,
+    }
+
+
+def _build_inspection_log(report: dict) -> str:
+    lines = [
+        "DEVICE INSPECTION REPORT",
+        "========================",
+        f"Timestamp      : {report['timestamp']}",
+        f"Serial         : {report['serial']}",
+        f"ADB Status     : {report['status']}",
+        f"ADB Transport  : {report['adb_state'] or '-'}",
+        f"Log File       : {report['log_path']}",
+        "",
+        "SUMMARY",
+        "-------",
+        f"Host Ping      : {report['summary'].get('host_ping', '-')}",
+        f"Device IP(s)   : {report['summary'].get('device_ips', '-')}",
+        f"Battery        : {report['summary'].get('battery', '-')}",
+        f"Power State    : {report['summary'].get('power', '-')}",
+        f"Electrical     : {report['summary'].get('electrical', '-')}",
+        f"Memory         : {report['summary'].get('memory', '-')}",
+        f"Storage        : {report['summary'].get('storage', '-')}",
+        f"Uptime         : {report['summary'].get('uptime', '-')}",
+        f"Boot Reason    : {report['summary'].get('boot_reason', '-')}",
+        "",
+        "ALERTS",
+        "------",
+    ]
+
+    alerts = report.get("alerts") or []
+    if alerts:
+        for index, alert in enumerate(alerts, start=1):
+            lines.append(
+                f"{index}. [{alert['level']}] {alert['category']} - {alert['title']}"
+            )
+            lines.append(f"   {alert['detail']}")
+    else:
+        lines.append("No critical issue detected from this inspection.")
+
+    lines.extend(
+        [
+            "",
+            "BOOT MARKERS",
+            "------------",
+            f"sys.boot_completed : {report['boot'].get('sys.boot_completed') or '-'}",
+            f"dev.bootcomplete   : {report['boot'].get('dev.bootcomplete') or '-'}",
+            f"init.svc.bootanim  : {report['boot'].get('init.svc.bootanim') or '-'}",
+            f"foreground_activity: {report['boot'].get('foreground_activity') or '-'}",
+            "",
+            "HARDWARE HEALTH",
+            "---------------",
+            f"Voltage        : {report['hardware']['electrical'].get('voltage_text', '-')}",
+            f"Temperature    : {report['hardware']['electrical'].get('temperature_text', '-')}",
+            f"Power Source   : {report['hardware']['electrical'].get('source_text', '-')}",
+            f"Memory         : {report['hardware']['memory'].get('summary', '-')}",
+            f"Storage        : {report['hardware'].get('storage_summary', '-')}",
+            f"Uptime         : {report['hardware'].get('uptime_text', '-')}",
+            f"Boot Reason    : {report['hardware'].get('boot_reason', '-')}",
+            "",
+            "RAW OUTPUTS",
+            "-----------",
+        ]
+    )
+
+    for key, value in report["raw"].items():
+        lines.append(f"[{key}]")
+        lines.append((value or "(empty)").strip())
+        lines.append("")
+
+    return "\n".join(lines).strip()
+
+
+def _collect_inspection_report(serial: str, log_path=None):
+    timestamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+    status = get_device_status(serial)
+    adb_state = run_adb(["-s", serial, "get-state"], timeout=4, log_timeout=False)
+    boot = {
+        "sys.boot_completed": "",
+        "dev.bootcomplete": "",
+        "init.svc.bootanim": "",
+        "foreground_activity": "",
+    }
+
+    raw = {
+        "adb_get_state": adb_state,
+        "host_ping": "",
+        "battery": "",
+        "power": "",
+        "meminfo": "",
+        "disk_usage": "",
+        "uptime": "",
+        "boot_reason": "",
+        "network_props": "",
+        "wlan0": "",
+        "eth0": "",
+        "ip_route": "",
+    }
+
+    ip = serial.split(":", 1)[0] if ":" in serial else ""
+    ping_summary = None
+    if ip:
+        raw["host_ping"] = run_host_command(["ping", "-n", "2", ip], timeout=8)
+        ping_summary = _parse_ping_summary(raw["host_ping"])
+
+    battery = {}
+    power = {}
+    memory = {}
+    storage_entries = []
+    device_ips = []
+    uptime_seconds = None
+    boot_reason = ""
+    hardware = {
+        "electrical": {
+            "voltage_raw": None,
+            "voltage_volts": None,
+            "voltage_text": "-",
+            "temperature_raw": None,
+            "temperature_c": None,
+            "temperature_text": "-",
+            "source_text": "-",
+        },
+        "memory": {
+            "summary": "-",
+        },
+        "storage": [],
+        "storage_summary": "-",
+        "uptime_seconds": None,
+        "uptime_text": "-",
+        "boot_reason": "-",
+    }
+
+    if status in ("CONNECTED", "BOOTING"):
+        boot = get_boot_diagnostics(serial)
+
+        raw["battery"] = run_adb(
+            ["-s", serial, "shell", "dumpsys", "battery"],
+            timeout=8,
+            log_timeout=False,
+        )
+        raw["power"] = run_adb(
+            ["-s", serial, "shell", "dumpsys", "power"],
+            timeout=8,
+            log_timeout=False,
+        )
+        raw["meminfo"] = run_adb(
+            ["-s", serial, "shell", "cat", "/proc/meminfo"],
+            timeout=6,
+            log_timeout=False,
+        )
+        raw["disk_usage"] = run_adb(
+            ["-s", serial, "shell", "df", "-k"],
+            timeout=8,
+            log_timeout=False,
+        )
+        raw["uptime"] = run_adb(
+            ["-s", serial, "shell", "cat", "/proc/uptime"],
+            timeout=4,
+            log_timeout=False,
+        )
+        raw["boot_reason"] = run_adb(
+            [
+                "-s",
+                serial,
+                "shell",
+                "sh",
+                "-c",
+                (
+                    "printf 'ro.boot.bootreason='; getprop ro.boot.bootreason; "
+                    "printf '\\nsys.boot.reason='; getprop sys.boot.reason"
+                ),
+            ],
+            timeout=6,
+            log_timeout=False,
+        )
+        raw["network_props"] = run_adb(
+            [
+                "-s",
+                serial,
+                "shell",
+                "sh",
+                "-c",
+                (
+                    "printf 'dhcp.wlan0.ipaddress='; getprop dhcp.wlan0.ipaddress; "
+                    "printf '\\ndhcp.eth0.ipaddress='; getprop dhcp.eth0.ipaddress; "
+                    "printf '\\nnet.hostname='; getprop net.hostname"
+                ),
+            ],
+            timeout=6,
+            log_timeout=False,
+        )
+        raw["wlan0"] = run_adb(
+            ["-s", serial, "shell", "ip", "addr", "show", "wlan0"],
+            timeout=6,
+            log_timeout=False,
+        )
+        raw["eth0"] = run_adb(
+            ["-s", serial, "shell", "ip", "addr", "show", "eth0"],
+            timeout=6,
+            log_timeout=False,
+        )
+        raw["ip_route"] = run_adb(
+            ["-s", serial, "shell", "ip", "route"],
+            timeout=6,
+            log_timeout=False,
+        )
+
+        battery = _parse_battery_summary(raw["battery"])
+        power = _extract_power_markers(raw["power"])
+        memory = _parse_meminfo(raw["meminfo"])
+        storage_entries = _parse_df_output(raw["disk_usage"])
+        uptime_seconds = _parse_uptime_seconds(raw["uptime"])
+
+        device_ips.extend(_extract_interface_ips(raw["wlan0"]))
+        device_ips.extend(_extract_interface_ips(raw["eth0"]))
+
+        for line in raw["network_props"].splitlines():
+            if "=" not in line:
+                continue
+            _, value = line.split("=", 1)
+            value = value.strip()
+            if value:
+                device_ips.append(value)
+
+        boot_reason_values = _parse_key_value_output(raw["boot_reason"])
+        boot_reason = (
+            boot_reason_values.get("sys.boot.reason")
+            or boot_reason_values.get("ro.boot.bootreason")
+            or ""
+        )
+
+    deduped_ips = []
+    for device_ip in device_ips:
+        if device_ip not in deduped_ips:
+            deduped_ips.append(device_ip)
+
+    alerts = []
+    if status == "UNAUTHORIZED":
+        alerts.append(
+            _make_alert(
+                "MEDIUM",
+                "ADB",
+                "ADB authorization belum diberikan",
+                "Periksa layar TV/STB lalu izinkan USB debugging agar command inspection bisa membaca detail perangkat.",
+            )
+        )
+
+    if status == "OFFLINE":
+        alerts.append(
+            _make_alert(
+                "HIGH",
+                "ADB",
+                "ADB device offline",
+                "Perangkat terlihat oleh ADB tetapi transport tidak stabil. Biasanya terkait jaringan putus-nyambung atau service adb di STB hang.",
+            )
+        )
+
+    if status == "BOOTING":
+        alerts.append(
+            _make_alert(
+                "MEDIUM",
+                "BOOT",
+                "Android belum selesai boot",
+                "ADB sudah merespons, tetapi marker boot belum lengkap. Jika lama berhenti di sini, cek kemungkinan boot loop atau aplikasi launcher macet.",
+            )
+        )
+
+    if ping_summary and ping_summary["loss_percent"] is not None:
+        if ping_summary["loss_percent"] == 100:
+            alerts.append(
+                _make_alert(
+                    "HIGH",
+                    "NETWORK",
+                    "Host tidak bisa ping perangkat",
+                    "IP perangkat tidak merespons sama sekali. Cek kabel LAN/Wi-Fi, IP berubah, atau perangkat mati.",
+                )
+            )
+        elif ping_summary["loss_percent"] > 0:
+            alerts.append(
+                _make_alert(
+                    "MEDIUM",
+                    "NETWORK",
+                    "Packet loss terdeteksi",
+                    f"Koneksi jaringan tidak stabil dengan packet loss {ping_summary['loss_percent']}%.",
+                )
+            )
+
+    if status == "OS DOWN":
+        detail = (
+            "Perangkat masih bisa diping dari host, jadi kemungkinan OS hang, reboot loop, atau service adb tidak aktif."
+            if ping_summary and ping_summary["loss_percent"] == 0
+            else "Perangkat tidak merespons di ADB maupun jaringan. Cek suplai listrik, kabel LAN, Wi-Fi, atau kemungkinan IP berubah."
+        )
+        alerts.append(
+            _make_alert(
+                "HIGH",
+                "POWER/OS",
+                "Perangkat tidak reachable",
+                detail,
+            )
+        )
+
+    if battery:
+        power_sources = [
+            battery.get("ac_powered"),
+            battery.get("usb_powered"),
+            battery.get("wireless_powered"),
+            battery.get("dock_powered"),
+        ]
+        level = battery.get("level")
+
+        if level is not None and level <= 15:
+            alerts.append(
+                _make_alert(
+                    "MEDIUM",
+                    "POWER",
+                    "Level baterai rendah",
+                    f"Battery level terbaca {level}%. Jika perangkat memakai baterai/UPS internal, cek suplai dayanya.",
+                )
+            )
+
+        if battery.get("present") and level is not None and level <= 5 and not any(
+            value is True for value in power_sources
+        ):
+            alerts.append(
+                _make_alert(
+                    "HIGH",
+                    "POWER",
+                    "Perangkat tidak terdeteksi sedang mendapat daya",
+                    "Semua sumber daya terbaca off dan level baterai sangat rendah. Ini indikasi kuat kendala listrik.",
+                )
+            )
+
+    if battery:
+        source_labels = []
+        for key, label in [
+            ("ac_powered", "AC"),
+            ("usb_powered", "USB"),
+            ("wireless_powered", "Wireless"),
+            ("dock_powered", "Dock"),
+        ]:
+            if battery.get(key) is True:
+                source_labels.append(label)
+
+        hardware["electrical"] = {
+            "voltage_raw": battery.get("voltage"),
+            "voltage_volts": _normalize_voltage(battery.get("voltage")),
+            "voltage_text": _format_voltage(battery.get("voltage")),
+            "temperature_raw": battery.get("temperature"),
+            "temperature_c": _normalize_temperature(battery.get("temperature")),
+            "temperature_text": _format_temperature(battery.get("temperature")),
+            "source_text": ", ".join(source_labels) if source_labels else "-",
+        }
+
+        temp_c = hardware["electrical"].get("temperature_c")
+        if temp_c is not None and temp_c >= 75:
+            alerts.append(
+                _make_alert(
+                    "HIGH",
+                    "THERMAL",
+                    "Suhu perangkat sangat tinggi",
+                    f"Temperature terbaca {temp_c:.1f} C. Periksa ventilasi, adaptor, dan beban kerja perangkat.",
+                )
+            )
+        elif temp_c is not None and temp_c >= 65:
+            alerts.append(
+                _make_alert(
+                    "MEDIUM",
+                    "THERMAL",
+                    "Suhu perangkat tinggi",
+                    f"Temperature terbaca {temp_c:.1f} C. Perangkat berisiko throttling atau restart jika kondisi ini menetap.",
+                )
+            )
+
+    if status in ("CONNECTED", "BOOTING") and not deduped_ips:
+        alerts.append(
+            _make_alert(
+                "MEDIUM",
+                "NETWORK",
+                "IP interface perangkat tidak terbaca",
+                "wlan0/eth0 belum menunjukkan alamat IP. Ada kemungkinan DHCP belum didapat atau interface jaringan belum aktif.",
+            )
+        )
+
+    if memory:
+        available_percent = memory.get("available_percent")
+        memory_summary = "-"
+        if memory.get("total_kb") is not None and memory.get("available_kb") is not None:
+            memory_summary = (
+                f"free {_format_kb(memory['available_kb'])} / {_format_kb(memory['total_kb'])}"
+            )
+            if available_percent is not None:
+                memory_summary += f" ({available_percent:.0f}% free)"
+
+        hardware["memory"] = {
+            **memory,
+            "summary": memory_summary,
+        }
+
+        if available_percent is not None and available_percent <= 5:
+            alerts.append(
+                _make_alert(
+                    "HIGH",
+                    "MEMORY",
+                    "Memori bebas sangat rendah",
+                    f"Sisa memori hanya {available_percent:.0f}% dari total. Device bisa lambat, force close, atau reboot.",
+                )
+            )
+        elif available_percent is not None and available_percent <= 10:
+            alerts.append(
+                _make_alert(
+                    "MEDIUM",
+                    "MEMORY",
+                    "Memori bebas rendah",
+                    f"Sisa memori hanya {available_percent:.0f}% dari total.",
+                )
+            )
+
+    if storage_entries:
+        hardware["storage"] = storage_entries
+        hardware["storage_summary"] = _build_storage_summary(storage_entries)
+
+        for entry in storage_entries:
+            usage = entry.get("use_percent")
+            if usage is None:
+                continue
+            if usage >= 95:
+                alerts.append(
+                    _make_alert(
+                        "HIGH",
+                        "STORAGE",
+                        f"Storage {entry['mount']} hampir penuh",
+                        f"Pemakaian storage {entry['mount']} sudah {usage}%. Ini berisiko menyebabkan app crash, update gagal, atau boot bermasalah.",
+                    )
+                )
+            elif usage >= 85:
+                alerts.append(
+                    _make_alert(
+                        "MEDIUM",
+                        "STORAGE",
+                        f"Storage {entry['mount']} tinggi",
+                        f"Pemakaian storage {entry['mount']} sudah {usage}%. Sebaiknya mulai dibersihkan.",
+                    )
+                )
+
+    hardware["uptime_seconds"] = uptime_seconds
+    hardware["uptime_text"] = _format_duration(uptime_seconds)
+    hardware["boot_reason"] = boot_reason or "-"
+
+    if boot_reason:
+        lowered_reason = boot_reason.lower()
+        if any(keyword in lowered_reason for keyword in ["watchdog", "panic", "kernel", "thermal"]):
+            alerts.append(
+                _make_alert(
+                    "MEDIUM",
+                    "BOOT",
+                    "Boot reason menunjukkan restart tidak normal",
+                    f"Boot reason device: {boot_reason}",
+                )
+            )
+
+    host_ping_summary = "-"
+    if ping_summary and ping_summary["loss_percent"] is not None:
+        average_text = (
+            f", avg {ping_summary['average_ms']} ms"
+            if ping_summary["average_ms"] is not None
+            else ""
+        )
+        host_ping_summary = (
+            f"{ping_summary['received']}/{ping_summary['sent']} reply, "
+            f"loss {ping_summary['loss_percent']}%{average_text}"
+        )
+
+    battery_summary = "-"
+    if battery:
+        level_text = (
+            f"{battery['level']}%"
+            if battery.get("level") is not None
+            else "unknown"
+        )
+        sources = []
+        for key, label in [
+            ("ac_powered", "AC"),
+            ("usb_powered", "USB"),
+            ("wireless_powered", "Wireless"),
+            ("dock_powered", "Dock"),
+        ]:
+            if battery.get(key) is True:
+                sources.append(label)
+        source_text = ", ".join(sources) if sources else "no external power detected"
+        battery_summary = f"level {level_text}, {source_text}"
+
+    power_summary = "-"
+    if power:
+        wakefulness = power.get("wakefulness") or "-"
+        display_state = power.get("display_state") or "-"
+        power_summary = f"wakefulness {wakefulness}, display {display_state}"
+
+    electrical_summary = "-"
+    if hardware["electrical"].get("voltage_text") != "-" or hardware["electrical"].get("temperature_text") != "-":
+        electrical_summary = (
+            f"voltage {hardware['electrical'].get('voltage_text', '-')}, "
+            f"temp {hardware['electrical'].get('temperature_text', '-')}"
+        )
+
+    memory_summary = hardware["memory"].get("summary", "-")
+    storage_summary = hardware.get("storage_summary", "-")
+    uptime_text = hardware.get("uptime_text", "-")
+    boot_reason_text = hardware.get("boot_reason", "-")
+
+    report = {
+        "timestamp": timestamp,
+        "serial": serial,
+        "status": status,
+        "adb_state": adb_state,
+        "boot": boot,
+        "alerts": alerts,
+        "summary": {
+            "host_ping": host_ping_summary,
+            "device_ips": ", ".join(deduped_ips) if deduped_ips else "-",
+            "battery": battery_summary,
+            "power": power_summary,
+            "electrical": electrical_summary,
+            "memory": memory_summary,
+            "storage": storage_summary,
+            "uptime": uptime_text,
+            "boot_reason": boot_reason_text,
+        },
+        "hardware": hardware,
+        "raw": raw,
+        "log_path": str(log_path) if log_path else "",
+    }
+    return report
+
+
+def _append_lines_to_log(log_path, lines):
+    path = Path(log_path)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    with open(path, "a", encoding="utf-8") as file_obj:
+        file_obj.write("\n\n" + "\n".join(lines).strip() + "\n")
+
+
+def _build_inspection_timeline(report: dict, reason: str, previous_status=None):
+    lines = [
+        "TIMELINE EVENT",
+        "--------------",
+        f"Timestamp      : {report['timestamp']}",
+        f"Reason         : {reason}",
+        f"Serial         : {report['serial']}",
+    ]
+
+    if previous_status:
+        lines.append(f"Status Change  : {previous_status} -> {report['status']}")
+    else:
+        lines.append(f"Status         : {report['status']}")
+
+    lines.extend(
+        [
+            f"ADB Transport  : {report['adb_state'] or '-'}",
+            f"Host Ping      : {report['summary'].get('host_ping', '-')}",
+            f"Device IP(s)   : {report['summary'].get('device_ips', '-')}",
+            f"Battery        : {report['summary'].get('battery', '-')}",
+            f"Power State    : {report['summary'].get('power', '-')}",
+            f"Electrical     : {report['summary'].get('electrical', '-')}",
+            f"Memory         : {report['summary'].get('memory', '-')}",
+            f"Storage        : {report['summary'].get('storage', '-')}",
+            f"Uptime         : {report['summary'].get('uptime', '-')}",
+            f"Boot Reason    : {report['summary'].get('boot_reason', '-')}",
+            "",
+            "Alerts",
+            "------",
+        ]
+    )
+
+    if report.get("alerts"):
+        for index, alert in enumerate(report["alerts"], start=1):
+            lines.append(
+                f"{index}. [{alert['level']}] {alert['category']} - {alert['title']}"
+            )
+            lines.append(f"   {alert['detail']}")
+    else:
+        lines.append("No alert on this checkpoint.")
+
+    lines.extend(
+        [
+            "",
+            "Boot Markers",
+            "------------",
+            f"sys.boot_completed : {report['boot'].get('sys.boot_completed') or '-'}",
+            f"dev.bootcomplete   : {report['boot'].get('dev.bootcomplete') or '-'}",
+            f"init.svc.bootanim  : {report['boot'].get('init.svc.bootanim') or '-'}",
+            f"foreground_activity: {report['boot'].get('foreground_activity') or '-'}",
+            "",
+            "Hardware Health",
+            "---------------",
+            f"Voltage        : {report['hardware']['electrical'].get('voltage_text', '-')}",
+            f"Temperature    : {report['hardware']['electrical'].get('temperature_text', '-')}",
+            f"Memory         : {report['hardware']['memory'].get('summary', '-')}",
+            f"Storage        : {report['hardware'].get('storage_summary', '-')}",
+            f"Uptime         : {report['hardware'].get('uptime_text', '-')}",
+            f"Boot Reason    : {report['hardware'].get('boot_reason', '-')}",
+        ]
+    )
+
+    return lines
+
+
+def append_inspection_event(log_path, serial: str, title: str, detail: str = "", status=""):
+    timestamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+    lines = [
+        "TIMELINE NOTE",
+        "-------------",
+        f"Timestamp      : {timestamp}",
+        f"Serial         : {serial}",
+        f"Event          : {title}",
+    ]
+
+    if status:
+        lines.append(f"Status         : {status}")
+
+    if detail:
+        lines.extend(["", "Detail", "------", detail])
+
+    _append_lines_to_log(log_path, lines)
+
+
+def append_inspection_checkpoint(log_path, serial: str, reason: str, previous_status=None):
+    report = _collect_inspection_report(serial, log_path=log_path)
+    lines = _build_inspection_timeline(report, reason, previous_status=previous_status)
+    _append_lines_to_log(log_path, lines)
+    report["log_text"] = Path(log_path).read_text(encoding="utf-8")
+    return report
+
+
+def collect_device_inspection(serial: str):
+    safe_serial = serial.replace(":", "_")
+    log_dir = ensure_runtime_dir("logs")
+    log_path = log_dir / (
+        f"inspection_{safe_serial}_{datetime.now().strftime('%Y%m%d_%H%M%S')}.log"
+    )
+
+    report = _collect_inspection_report(serial, log_path=log_path)
+    report["log_text"] = _build_inspection_log(report)
+
+    with open(log_path, "w", encoding="utf-8") as file_obj:
+        file_obj.write(report["log_text"])
+
+    append_inspection_event(
+        log_path,
+        serial,
+        "Inspection monitor started",
+        detail="Status device setelah ini akan di-append ke file ini saat ada perubahan state penting.",
+        status=report["status"],
+    )
+    report["log_text"] = Path(log_path).read_text(encoding="utf-8")
+    return report

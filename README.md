@@ -38,7 +38,9 @@ At runtime:
 
 - bundled resources are extracted automatically by PyInstaller
 - `data\saved_devices.json` is created automatically from `data\saved_devices.template.json`
-- writable files such as `data\saved_devices.json` and `screenshots\` stay next to the `.exe`
+- writable files such as `data\saved_devices.json`, `screenshots\`, and `logs\inspection_*.log` stay next to the `.exe`
+- each `Inspection` run creates a monitor log and appends important status changes such as reboot, booting, offline, and connected
+- inspection also summarizes hardware signals that are readable over ADB, including voltage/temperature, memory, storage usage, uptime, and boot reason
 
 ## Support
 
