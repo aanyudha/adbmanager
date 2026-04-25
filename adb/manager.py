@@ -667,6 +667,52 @@ def _pick_primary_storage_entry(storage_entries):
     return storage_entries[0]
 
 
+def _is_ignored_system_storage_mount(mount: str) -> bool:
+    mount = (mount or "").strip()
+    return mount in {
+        "/system",
+        "/system_ext",
+        "/vendor",
+        "/product",
+        "/odm",
+        "/vendor_dlkm",
+        "/system_dlkm",
+        "/system/vendor",
+    }
+
+
+def _build_storage_alert(entry, device_status: str):
+    mount = (entry.get("mount") or "").strip()
+    usage = entry.get("use_percent")
+
+    if usage is None or not mount:
+        return None
+
+    if _is_ignored_system_storage_mount(mount):
+        return None
+
+    if mount == "/" and device_status not in ("BOOTING", "OS DOWN"):
+        return None
+
+    if usage >= 95:
+        return _make_alert(
+            "HIGH",
+            "STORAGE",
+            f"Storage {mount} hampir penuh",
+            f"Pemakaian storage {mount} sudah {usage}%. Ini berisiko menyebabkan app crash, update gagal, atau boot bermasalah.",
+        )
+
+    if usage >= 85:
+        return _make_alert(
+            "MEDIUM",
+            "STORAGE",
+            f"Storage {mount} tinggi",
+            f"Pemakaian storage {mount} sudah {usage}%. Sebaiknya mulai dibersihkan.",
+        )
+
+    return None
+
+
 def get_device_health_snapshot(serial: str):
     battery_output = run_adb(
         ["-s", serial, "shell", "dumpsys", "battery"],
@@ -1129,27 +1175,9 @@ def _collect_inspection_report(serial: str, log_path=None):
         hardware["storage_summary"] = _build_storage_summary(storage_entries)
 
         for entry in storage_entries:
-            usage = entry.get("use_percent")
-            if usage is None:
-                continue
-            if usage >= 95:
-                alerts.append(
-                    _make_alert(
-                        "HIGH",
-                        "STORAGE",
-                        f"Storage {entry['mount']} hampir penuh",
-                        f"Pemakaian storage {entry['mount']} sudah {usage}%. Ini berisiko menyebabkan app crash, update gagal, atau boot bermasalah.",
-                    )
-                )
-            elif usage >= 85:
-                alerts.append(
-                    _make_alert(
-                        "MEDIUM",
-                        "STORAGE",
-                        f"Storage {entry['mount']} tinggi",
-                        f"Pemakaian storage {entry['mount']} sudah {usage}%. Sebaiknya mulai dibersihkan.",
-                    )
-                )
+            alert = _build_storage_alert(entry, status)
+            if alert:
+                alerts.append(alert)
 
     hardware["uptime_seconds"] = uptime_seconds
     hardware["uptime_text"] = _format_duration(uptime_seconds)
