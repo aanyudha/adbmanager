@@ -8,7 +8,7 @@ Portable Windows desktop app for managing Android STB devices over ADB.
 python main.py
 ```
 
-## Build `.exe`
+## Build single-file `.exe`
 
 1. Install dependencies:
 
@@ -16,7 +16,7 @@ python main.py
 python -m pip install -r requirements.txt
 ```
 
-2. Build the portable package:
+2. Build the executable:
 
 ```powershell
 powershell -ExecutionPolicy Bypass -File .\scripts\build_exe.ps1
@@ -24,14 +24,17 @@ powershell -ExecutionPolicy Bypass -File .\scripts\build_exe.ps1
 
 Build output:
 
-- `dist\HeisenbergADBTool\`
-- `dist\HeisenbergADBTool-portable.zip`
+- `dist\HeisenbergADBTool.exe`
+- `dist\HeisenbergADBTool-single-exe.zip`
 
-The build includes:
+This build bundles:
 
-- `HeisenbergADBTool.exe`
-- bundled `adb\`
-- bundled `scrcpy\`
-- bundled `data\`
+- application UI
+- `adb`
+- `scrcpy`
+- default `data`
 
-This means users can extract the folder or zip and run the app without manually copying `scrcpy`.
+At runtime:
+
+- bundled resources are extracted automatically by PyInstaller
+- writable files such as `data\saved_devices.json` and `screenshots\` stay next to the `.exe`

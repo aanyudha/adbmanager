@@ -3,14 +3,14 @@ import subprocess
 import time
 
 from utils.logger import log_error
-from utils.paths import get_app_root
+from utils.paths import get_bundle_root
 
 
 # =========================================================
 # CORE EXEC
 # =========================================================
 
-BASE_DIR = get_app_root()
+BASE_DIR = get_bundle_root()
 ADB_EXE = BASE_DIR / "adb" / "adb.exe"
 SCRCPY_EXE = BASE_DIR / "scrcpy" / "scrcpy.exe"
 

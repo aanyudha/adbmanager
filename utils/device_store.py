@@ -1,10 +1,10 @@
 import json
 
-from utils.paths import ensure_runtime_dir, get_runtime_path
+from utils.paths import ensure_runtime_dir, ensure_runtime_file
 
 
 DATA_DIR = ensure_runtime_dir("data")
-FILE = get_runtime_path("data", "saved_devices.json")
+FILE = ensure_runtime_file(("data", "saved_devices.json"))
 
 
 def load_devices():
