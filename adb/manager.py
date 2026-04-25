@@ -1,5 +1,8 @@
+import shlex
 import subprocess
 import time
+from pathlib import Path
+
 from utils.logger import log_error
 
 
@@ -7,17 +10,40 @@ from utils.logger import log_error
 # CORE EXEC
 # =========================================================
 
-def run_adb(args) -> str:
-    try:
-        if isinstance(args, str):
-            args = args.split()
+BASE_DIR = Path(__file__).resolve().parent.parent
+ADB_EXE = BASE_DIR / "adb" / "adb.exe"
+SCRCPY_EXE = BASE_DIR / "scrcpy" / "scrcpy.exe"
 
+
+def _normalize_args(args):
+    if isinstance(args, str):
+        return shlex.split(args, posix=False)
+    return list(args)
+
+
+def run_adb(args, timeout=15) -> str:
+    try:
         result = subprocess.run(
-            ["adb"] + args,
+            [str(ADB_EXE)] + _normalize_args(args),
             capture_output=True,
-            text=True
+            text=True,
+            cwd=str(ADB_EXE.parent),
+            timeout=timeout
         )
-        return result.stdout.strip()
+
+        stdout = result.stdout.strip()
+        stderr = result.stderr.strip()
+        output = "\n".join(part for part in (stdout, stderr) if part).strip()
+
+        if not output and result.returncode != 0:
+            output = f"adb exited with code {result.returncode}"
+
+        return output
+
+    except subprocess.TimeoutExpired:
+        message = f"adb command timed out after {timeout}s"
+        log_error(message)
+        return message
 
     except Exception as e:
         log_error(str(e))
@@ -28,8 +54,8 @@ def run_adb(args) -> str:
 # BASIC COMMANDS
 # =========================================================
 
-def adb_connect(ip: str, port: str) -> str:
-    return run_adb(["connect", f"{ip}:{port}"])
+def adb_connect(ip: str, port: str, timeout=3) -> str:
+    return run_adb(["connect", f"{ip}:{port}"], timeout=timeout)
 
 
 def adb_reboot(serial: str) -> str:
@@ -40,12 +66,30 @@ def adb_poweroff(serial: str) -> str:
     return run_adb(["-s", serial, "shell", "reboot", "-p"])
 
 
+def adb_wake(serial: str) -> str:
+    outputs = []
+
+    for args in [
+        ["-s", serial, "shell", "input", "keyevent", "224"],
+        ["-s", serial, "shell", "wm", "dismiss-keyguard"],
+        ["-s", serial, "shell", "input", "keyevent", "82"],
+    ]:
+        result = run_adb(args, timeout=3)
+        if result:
+            outputs.append(result)
+
+    return "\n".join(outputs).strip() or "Wake command sent."
+
+
 def adb_screenshot(serial: str, filename: str) -> str:
     try:
         with open(filename, "wb") as f:
             subprocess.run(
-                ["adb", "-s", serial, "exec-out", "screencap", "-p"],
-                stdout=f
+                [str(ADB_EXE), "-s", serial, "exec-out", "screencap", "-p"],
+                stdout=f,
+                cwd=str(ADB_EXE.parent),
+                timeout=30,
+                check=False
             )
         return "OK"
     except Exception as e:
@@ -59,41 +103,36 @@ def adb_screenshot(serial: str, filename: str) -> str:
 
 def launch_scrcpy(serial: str):
     subprocess.Popen([
-        "scrcpy",
+        str(SCRCPY_EXE),
         "-s", serial,
         "--render-driver=direct3d",
         "--max-size", "640",
         "--video-bit-rate", "600K",
         "--max-fps", "15",
         "--no-audio"
-    ])
+    ], cwd=str(SCRCPY_EXE.parent))
 
 
 # =========================================================
 # DEVICE STATUS
 # =========================================================
 
-import subprocess
-
 def connect_device(serial):
-    try:
-        result = subprocess.run(
-            ["adb", "connect", serial],
-            capture_output=True,
-            text=True
-        )
-        return result.stdout.strip()
-    except Exception as e:
-        return str(e)
-    
-def get_all_device_status():
-    # 🔥 Warm-up call (force adb refresh internal state)
+    return run_adb(["connect", serial], timeout=3)
+
+
+def get_all_device_status(refresh_serials=None):
+    refresh_serials = refresh_serials or []
+
+    for serial in refresh_serials:
+        run_adb(["connect", serial], timeout=2)
+
+    # Warm-up call to let adb refresh its internal device list.
     run_adb(["devices"])
     time.sleep(0.3)
 
     out = run_adb(["devices"])
     status_map = {}
-
     lines = out.splitlines()[1:]
 
     for line in lines:
@@ -107,7 +146,6 @@ def get_all_device_status():
             status_map[serial] = status
 
     return status_map
-    
 
 
 def get_device_status(serial: str) -> str:
@@ -116,22 +154,21 @@ def get_device_status(serial: str) -> str:
 
     if status == "device":
         return "CONNECTED"
-    elif status == "unauthorized":
+    if status == "unauthorized":
         return "UNAUTHORIZED"
-    elif status == "offline":
+    if status == "offline":
         return "OFFLINE"
-    else:
-        return "OS DOWN"
+    return "OS DOWN"
 
 
 def auto_reconnect(serial, ip, port):
     if get_device_status(serial) != "CONNECTED":
-        adb_connect(ip, port)
+        adb_connect(ip, port, timeout=2)
         time.sleep(1)
 
 
 def adb_shell(serial, command):
-    return run_adb(["-s", serial, "shell"] + command.split())
+    return run_adb(["-s", serial, "shell", command])
 
 
 def adb_send_key(serial: str, keycode: int, delay: float = 0.3):
@@ -140,7 +177,7 @@ def adb_send_key(serial: str, keycode: int, delay: float = 0.3):
 
 
 def adb_vendor_settings_combo(serial: str):
-    # Back → Right → Left → Right → Left → Up → Down → Back
+    # Back -> Right -> Left -> Right -> Left -> Up -> Down -> Back
     sequence = [4, 22, 21, 22, 21, 19, 20, 4]
 
     for key in sequence:
