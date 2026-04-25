@@ -1,13 +1,28 @@
 import json
+import shutil
 
-from utils.paths import ensure_runtime_dir, ensure_runtime_file
+from utils.paths import ensure_runtime_dir, get_bundle_path, get_runtime_path
 
 
 DATA_DIR = ensure_runtime_dir("data")
-FILE = ensure_runtime_file(("data", "saved_devices.json"))
+FILE = get_runtime_path("data", "saved_devices.json")
+TEMPLATE = get_bundle_path("data", "saved_devices.template.json")
+
+
+def ensure_device_store():
+    if FILE.exists():
+        return FILE
+
+    FILE.parent.mkdir(parents=True, exist_ok=True)
+
+    if TEMPLATE.exists():
+        shutil.copy2(TEMPLATE, FILE)
+
+    return FILE
 
 
 def load_devices():
+    ensure_device_store()
     if not FILE.exists():
         return []
     with open(FILE, "r", encoding="utf-8") as f:
@@ -15,6 +30,7 @@ def load_devices():
 
 
 def save_devices(devices):
+    ensure_device_store()
     with open(FILE, "w", encoding="utf-8") as f:
         json.dump(devices, f, indent=2)
 

@@ -32,11 +32,12 @@ This build bundles:
 - application UI
 - `adb`
 - `scrcpy`
-- default `data`
+- default `data` template
 
 At runtime:
 
 - bundled resources are extracted automatically by PyInstaller
+- `data\saved_devices.json` is created automatically from `data\saved_devices.template.json`
 - writable files such as `data\saved_devices.json` and `screenshots\` stay next to the `.exe`
 
 ## Support

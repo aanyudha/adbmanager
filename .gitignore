@@ -1,6 +1,8 @@
 # Generated screenshots
 screenshots/*.png
 !screenshots/.gitkeep
+data/*.json
+!data/*.template.json
 __pycache__/
 *.pyc
 *.pyo
