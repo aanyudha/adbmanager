@@ -1,16 +1,16 @@
 import shlex
 import subprocess
 import time
-from pathlib import Path
 
 from utils.logger import log_error
+from utils.paths import get_app_root
 
 
 # =========================================================
 # CORE EXEC
 # =========================================================
 
-BASE_DIR = Path(__file__).resolve().parent.parent
+BASE_DIR = get_app_root()
 ADB_EXE = BASE_DIR / "adb" / "adb.exe"
 SCRCPY_EXE = BASE_DIR / "scrcpy" / "scrcpy.exe"
 

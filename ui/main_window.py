@@ -1,5 +1,6 @@
 import os
 import time
+from pathlib import Path
 
 from PySide6.QtCore import QThread, Qt, QTimer, Signal
 from PySide6.QtGui import QColor
@@ -36,6 +37,7 @@ from adb.manager import (
     launch_scrcpy,
 )
 from utils.device_store import add_device, load_devices
+from utils.paths import ensure_runtime_dir
 
 
 RAW_STATUS_ICONS = {
@@ -764,10 +766,14 @@ ABI List       : {info['abi_list']}
         if not self.active_serial:
             return
 
-        os.makedirs("screenshots", exist_ok=True)
-        filename = f"screenshots/{self.active_serial.replace(':', '_')}_{int(time.time())}.png"
-        adb_screenshot(self.active_serial, filename)
-        QMessageBox.information(self, "Screenshot", f"Saved:\n{filename}")
+        screenshots_dir = ensure_runtime_dir("screenshots")
+        filename = screenshots_dir / f"{self.active_serial.replace(':', '_')}_{int(time.time())}.png"
+        adb_screenshot(self.active_serial, str(filename))
+        QMessageBox.information(
+            self,
+            "Screenshot",
+            f"Saved:\n{filename.relative_to(Path.cwd()) if filename.is_relative_to(Path.cwd()) else filename}",
+        )
 
     def open_settings(self):
         if not self.active_serial:

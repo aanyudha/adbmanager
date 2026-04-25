@@ -1,2 +1,9 @@
 # Generated screenshots
 screenshots/*.png
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+build/
+dist/
+*.spec
