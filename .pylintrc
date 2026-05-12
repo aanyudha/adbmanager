@@ -1,0 +1,24 @@
+[MASTER]
+ignore=__pycache__
+
+[MESSAGES CONTROL]
+disable=
+    missing-module-docstring,
+    missing-class-docstring,
+    missing-function-docstring,
+    too-few-public-methods,
+    too-many-lines,
+    too-many-instance-attributes,
+    too-many-public-methods,
+    too-many-locals,
+    too-many-branches,
+    too-many-statements,
+    too-many-nested-blocks,
+    broad-exception-caught,
+    subprocess-run-check,
+    import-outside-toplevel,
+    invalid-name,
+    import-error
+
+[FORMAT]
+max-line-length=140
