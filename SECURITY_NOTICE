@@ -1,0 +1,2 @@
+This tool is intended for device management and debugging purposes only.
+Do not use on devices you do not own or have permission to manage.
