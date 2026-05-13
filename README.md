@@ -41,6 +41,16 @@ At runtime:
 - writable files such as `data\saved_devices.json`, `screenshots\`, and `logs\inspection_*.log` stay next to the `.exe`
 - each `Inspection` run creates a monitor log and appends important status changes such as reboot, booting, offline, and connected
 - inspection also summarizes hardware signals that are readable over ADB, including voltage/temperature, memory, storage usage, uptime, and boot reason
+## Features
+
+- ADB device manager
+- Wireless ADB support
+- APK installer
+- Batch command execution
+- Screenshot capture
+- Device inspection
+- Advanced logging
+- scrcpy integration
 
 ## Support
 
