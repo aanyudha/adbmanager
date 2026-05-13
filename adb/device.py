@@ -24,17 +24,14 @@ class AndroidDevice:
             "device": self.get_prop("ro.product.device"),
             "board": self.get_prop("ro.product.board"),
             "hardware": self.get_prop("ro.hardware"),
-
             "android_version": self.get_prop("ro.build.version.release"),
             "sdk": self.get_prop("ro.build.version.sdk"),
             "security_patch": self.get_prop("ro.build.version.security_patch"),
-
             "firmware": self.get_prop("ro.build.display.id"),
             "build_id": self.get_prop("ro.build.id"),
             "build_type": self.get_prop("ro.build.type"),
             "build_tags": self.get_prop("ro.build.tags"),
             "fingerprint": self.get_prop("ro.build.fingerprint"),
-
             "abi": self.get_prop("ro.product.cpu.abi"),
             "abi_list": self.get_prop("ro.product.cpu.abilist"),
         }
@@ -61,5 +58,6 @@ class Device:
 
     def refresh(self, serial):
         from adb.manager import get_device_status
+
         self.state = get_device_status(serial)
         return self.state

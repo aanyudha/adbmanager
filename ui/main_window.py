@@ -1,4 +1,3 @@
-import os
 import time
 import html
 from pathlib import Path
@@ -32,11 +31,9 @@ from adb.manager import (
     adb_reboot,
     adb_screenshot,
     get_boot_diagnostics,
-    adb_send_notification,
     adb_shell,
     adb_vendor_settings_combo,
     adb_wake,
-    auto_reconnect,
     collect_device_inspection,
     get_device_health_snapshot,
     get_all_device_status,
@@ -90,9 +87,11 @@ STATUS_THEME = {
 }
 
 ACTIVE_WATCHDOG_INTERVAL_MS = 1500
-BACKGROUND_STATUS_INTERVAL_SECONDS = 2
+# A longer interval keeps reconnect attempts from hammering adb when many saved
+# devices are already healthy, while the UI still updates as each worker cycle finishes.
+BACKGROUND_STATUS_INTERVAL_SECONDS = 10
 SAVED_DEVICE_HEALTH_REFRESH_SECONDS = 15
-SCANNED_DEVICE_REFRESH_SECONDS = 10
+STATUS_WORKER_SLEEP_CHUNK_MS = 200
 
 
 class StatusWorker(QThread):
@@ -101,11 +100,13 @@ class StatusWorker(QThread):
     def __init__(
         self,
         get_devices_callback,
+        get_tracked_serials_callback=None,
         interval=BACKGROUND_STATUS_INTERVAL_SECONDS,
         health_refresh_seconds=SAVED_DEVICE_HEALTH_REFRESH_SECONDS,
     ):
         super().__init__()
         self.get_devices = get_devices_callback
+        self.get_tracked_serials = get_tracked_serials_callback or (lambda: [])
         self.interval = interval
         self.health_refresh_seconds = health_refresh_seconds
         self.health_cache = {}
@@ -123,7 +124,12 @@ class StatusWorker(QThread):
                     if ip:
                         saved_serials.append(f"{ip}:{port}")
 
-                status_map = get_all_device_status(refresh_serials=saved_serials)
+                tracked_serials = list(saved_serials)
+                for serial in self.get_tracked_serials() or []:
+                    if serial and serial not in tracked_serials:
+                        tracked_serials.append(serial)
+
+                status_map = get_all_device_status(refresh_serials=tracked_serials)
                 now = time.time()
                 active_serials = set(saved_serials)
 
@@ -139,6 +145,8 @@ class StatusWorker(QThread):
                     if cached and (now - cached.get("fetched_at", 0)) < self.health_refresh_seconds:
                         continue
 
+                    # Health probes stay in the worker because some adb shell
+                    # calls can stall for seconds on busy or half-online devices.
                     snapshot = get_device_health_snapshot(serial)
                     snapshot["fetched_at"] = now
                     self.health_cache[serial] = snapshot
@@ -160,10 +168,12 @@ class StatusWorker(QThread):
             except Exception as e:
                 print("StatusWorker error:", e)
 
-            for _ in range(int(self.interval * 10)):
+            sleep_step_ms = STATUS_WORKER_SLEEP_CHUNK_MS
+            total_sleep_ms = max(int(self.interval * 1000), sleep_step_ms)
+            for _ in range(total_sleep_ms // sleep_step_ms):
                 if not self.running:
                     return
-                self.msleep(100)
+                self.msleep(sleep_step_ms)
 
     def stop(self):
         self.running = False
@@ -200,7 +210,9 @@ class MainWindow(QMainWindow):
         self.inspection_sessions = {}
         self.inspection_worker = None
         self.reboot_worker = None
-        self.last_background_scan_refresh_at = 0.0
+        self.info_worker = None
+        self.pending_info_request = None
+        self.last_status_map = {}
 
         self.tabs = QTabWidget()
         self.tab_import = QWidget()
@@ -223,6 +235,7 @@ class MainWindow(QMainWindow):
 
         self.status_worker = StatusWorker(
             get_devices_callback=lambda: self.saved_devices,
+            get_tracked_serials_callback=self.get_background_tracked_serials,
             interval=BACKGROUND_STATUS_INTERVAL_SECONDS,
             health_refresh_seconds=SAVED_DEVICE_HEALTH_REFRESH_SECONDS,
         )
@@ -517,6 +530,33 @@ public_key=MIIBIjANBgkqhkiG9w0BAQEFAAOCAQ8ASAMPLEPUBLICKEY2
             serials.append(self.make_serial(ip, device.get("port")))
         return serials
 
+    def get_background_tracked_serials(self):
+        serials = []
+
+        if self.active_serial and ":" in self.active_serial:
+            serials.append(self.active_serial)
+
+        for serial in self.inspection_sessions:
+            if ":" in serial and serial not in serials:
+                serials.append(serial)
+
+        return serials
+
+    def get_display_path(self, path):
+        target_path = Path(path)
+        cwd = Path.cwd()
+
+        try:
+            return target_path.relative_to(cwd)
+        except ValueError:
+            return target_path
+
+    def get_scanned_raw_status(self, serial):
+        for device in self.devices:
+            if device.serial == serial:
+                return device.status
+        return None
+
     def get_item_serial(self, item):
         if item is None:
             return None
@@ -547,11 +587,7 @@ public_key=MIIBIjANBgkqhkiG9w0BAQEFAAOCAQ8ASAMPLEPUBLICKEY2
         if log_path.exists():
             log_text = log_path.read_text(encoding="utf-8")
 
-        display_path = (
-            log_path.relative_to(Path.cwd())
-            if log_path.is_relative_to(Path.cwd())
-            else log_path
-        )
+        display_path = self.get_display_path(log_path)
         self.inspection_meta.setText(
             f"Inspection monitor aktif: {display_path} | Last status: {session.get('last_logged_status', '-')}"
         )
@@ -781,7 +817,7 @@ public_key=MIIBIjANBgkqhkiG9w0BAQEFAAOCAQ8ASAMPLEPUBLICKEY2
         self.update_ui_by_status(status)
 
         if refresh_info or status_changed:
-            self.show_device_info_by_serial(self.active_serial, status=status)
+            self.request_device_info_refresh(self.active_serial, status=status)
 
         return status_changed
 
@@ -867,7 +903,12 @@ public_key=MIIBIjANBgkqhkiG9w0BAQEFAAOCAQ8ASAMPLEPUBLICKEY2
         self.scan_devices()
         self.load_saved_devices()
 
-        status = get_device_status(self.active_serial)
+        raw_status = (
+            self.get_scanned_raw_status(self.active_serial)
+            or self.last_status_map.get(self.active_serial)
+            or "offline"
+        )
+        status = self.raw_status_to_ui_status(raw_status)
         self.sync_active_device_state(status, refresh_info=True)
 
     def scan_devices(self):
@@ -894,8 +935,7 @@ public_key=MIIBIjANBgkqhkiG9w0BAQEFAAOCAQ8ASAMPLEPUBLICKEY2
             self.device_list.setCurrentItem(selected_item)
 
     def apply_device_filters(self):
-        status_map = get_all_device_status()
-        self.refresh_saved_list(status_map)
+        self.refresh_saved_list(self.last_status_map)
         self.scan_devices()
 
     def set_controls_enabled(self, enabled):
@@ -936,9 +976,9 @@ public_key=MIIBIjANBgkqhkiG9w0BAQEFAAOCAQ8ASAMPLEPUBLICKEY2
             self.ip_input.setText(ip)
             self.port_input.setText(port)
 
-        status = self.raw_status_to_ui_status(raw_status)
-        if raw_status == "device":
-            status = get_device_status(serial)
+        status = self.raw_status_to_ui_status(
+            self.last_status_map.get(serial, raw_status)
+        )
 
         self.sync_active_device_state(
             status,
@@ -961,31 +1001,75 @@ public_key=MIIBIjANBgkqhkiG9w0BAQEFAAOCAQ8ASAMPLEPUBLICKEY2
         self.ip_input.setText(ip)
         self.port_input.setText(port)
 
-        adb_connect(ip, port, timeout=2)
-        self.sync_active_device_state(get_device_status(serial), refresh_info=True)
+        raw_status = self.last_status_map.get(serial, item.data(Qt.UserRole + 1) or "offline")
+        self.sync_active_device_state(
+            self.raw_status_to_ui_status(raw_status),
+            refresh_info=True,
+        )
 
-    def show_device_info_by_serial(self, serial, status=None):
+    def build_device_info_text(self, serial, status=None):
+        # adb reads for device details must stay off the UI thread; several
+        # properties and dumpsys calls can block long enough to trigger
+        # "Not Responding" in a windowed EXE.
         try:
             status = status or get_device_status(serial)
 
             if status == "BOOTING":
-                self.info_box.setText(
-                    self.format_boot_diagnostics(
-                        serial,
-                        get_boot_diagnostics(serial),
-                    )
+                return self.format_boot_diagnostics(
+                    serial,
+                    get_boot_diagnostics(serial),
                 )
-                return
 
             if status != "CONNECTED":
-                self.info_box.setText(f"Device not ready\n\nStatus: {status}")
-                return
+                return f"Device not ready\n\nStatus: {status}"
 
             device = AndroidDevice(serial, "device")
-            self.info_box.setText(self.format_device_info(device.info()))
+            return self.format_device_info(device.info())
 
         except Exception as e:
-            self.info_box.setText(f"Failed to read device info\n\n{e}")
+            return f"Failed to read device info\n\n{e}"
+
+    def request_device_info_refresh(self, serial, status=None):
+        if not serial:
+            return
+
+        if self.info_worker and self.info_worker.isRunning():
+            self.pending_info_request = {"serial": serial, "status": status}
+            return
+
+        self.pending_info_request = None
+        self.info_box.setText(
+            "Loading device info...\n\nADB queries are running in the background."
+        )
+
+        target_serial = serial
+        target_status = status
+        self.info_worker = DeviceActionWorker(
+            lambda: {
+                "serial": target_serial,
+                "status": target_status,
+                "text": self.build_device_info_text(
+                    target_serial,
+                    status=target_status,
+                ),
+            }
+        )
+        self.info_worker.result_ready.connect(self.on_device_info_ready)
+        self.info_worker.start()
+
+    def on_device_info_ready(self, payload):
+        self.info_worker = None
+
+        if isinstance(payload, dict) and payload.get("serial") == self.active_serial:
+            self.info_box.setText(payload.get("text", ""))
+
+        if self.pending_info_request:
+            pending = self.pending_info_request
+            self.pending_info_request = None
+            self.request_device_info_refresh(
+                pending.get("serial"),
+                status=pending.get("status"),
+            )
 
     def format_boot_diagnostics(self, serial, diagnostics):
         foreground = diagnostics.get("foreground_activity") or "-"
@@ -1047,8 +1131,7 @@ ABI List       : {info['abi_list']}
     # ================= SAVED DEVICE =================
 
     def load_saved_devices(self):
-        status_map = get_all_device_status()
-        self.refresh_saved_list(status_map, reload_devices=True)
+        self.refresh_saved_list(self.last_status_map, reload_devices=True)
 
     def save_current_device(self):
         if not self.active_serial:
@@ -1069,13 +1152,10 @@ ABI List       : {info['abi_list']}
     def update_saved_device_status(self, payload):
         status_map = payload.get("status_map", {}) if isinstance(payload, dict) else payload
         health_map = payload.get("health_map", {}) if isinstance(payload, dict) else {}
+        self.last_status_map = dict(status_map)
         if health_map:
             self.saved_device_health.update(health_map)
         self.refresh_saved_list(status_map)
-        now = time.time()
-        if now - self.last_background_scan_refresh_at >= SCANNED_DEVICE_REFRESH_SECONDS:
-            self.scan_devices()
-            self.last_background_scan_refresh_at = now
 
         if self.active_source == "saved" and self.active_serial:
             raw_status = status_map.get(self.active_serial, "offline")
@@ -1085,10 +1165,11 @@ ABI List       : {info['abi_list']}
             )
 
     def closeEvent(self, event):
+        self.timer.stop()
         if hasattr(self, "status_worker"):
             self.status_worker.stop()
             self.status_worker.wait(2000)
-        for worker in [self.inspection_worker, self.reboot_worker]:
+        for worker in [self.info_worker, self.inspection_worker, self.reboot_worker]:
             if worker and worker.isRunning():
                 worker.wait(2000)
         event.accept()
@@ -1196,10 +1277,15 @@ ABI List       : {info['abi_list']}
             adb_connect(ip, port, timeout=2)
 
         message = adb_wake(self.active_serial)
-        status = get_device_status(self.active_serial)
 
         self.scan_devices()
         self.load_saved_devices()
+        raw_status = (
+            self.get_scanned_raw_status(self.active_serial)
+            or self.last_status_map.get(self.active_serial)
+            or "offline"
+        )
+        status = self.raw_status_to_ui_status(raw_status)
         self.sync_active_device_state(status, refresh_info=True)
 
         if status == "OS DOWN":
@@ -1249,7 +1335,7 @@ ABI List       : {info['abi_list']}
         QMessageBox.information(
             self,
             "Screenshot",
-            f"Saved:\n{filename.relative_to(Path.cwd()) if filename.is_relative_to(Path.cwd()) else filename}",
+            f"Saved:\n{self.get_display_path(filename)}",
         )
 
     def open_settings(self):
@@ -1440,7 +1526,7 @@ ABI List       : {info['abi_list']}
             return
 
         self.remember_inspection_session(result)
-        self.refresh_saved_list(get_all_device_status())
+        self.refresh_saved_list(self.last_status_map)
 
         if serial == self.active_serial:
             self.render_inspection_session(serial)
@@ -1498,40 +1584,27 @@ ABI List       : {info['abi_list']}
     # ================= WATCHDOG =================
 
     def watchdog(self):
-        active_status = None
-
         if self.active_serial:
-            active_status = get_device_status(self.active_serial)
-            status_changed = self.sync_active_device_state(
-                active_status,
-                refresh_info=False,
-            )
-
-            if status_changed:
-                self.capture_monitored_inspection_checkpoint(
-                    "Status change detected by watchdog",
-                    status=active_status,
-                    serial=self.active_serial,
+            raw_status = self.last_status_map.get(self.active_serial)
+            if raw_status:
+                active_status = self.raw_status_to_ui_status(raw_status)
+                status_changed = self.sync_active_device_state(
+                    active_status,
+                    refresh_info=False,
                 )
 
-            if active_status == "UNAUTHORIZED":
-                adb_send_notification(
-                    self.active_serial,
-                    "ADB Authorization",
-                    "Allow USB debugging using your remote",
-                )
-
-            elif active_status in ("OFFLINE", "OS DOWN"):
-                ip = self.ip_input.text().strip()
-                port = self.normalize_port(self.port_input.text())
-                if ip:
-                    auto_reconnect(self.active_serial, ip, port)
+                if status_changed:
+                    self.capture_monitored_inspection_checkpoint(
+                        "Status change detected by watchdog",
+                        status=active_status,
+                        serial=self.active_serial,
+                    )
 
         for serial, session in list(self.inspection_sessions.items()):
-            if serial == self.active_serial:
+            if serial == self.active_serial or serial not in self.last_status_map:
                 continue
 
-            status = get_device_status(serial)
+            status = self.raw_status_to_ui_status(self.last_status_map.get(serial))
             if status != session.get("last_logged_status"):
                 self.capture_monitored_inspection_checkpoint(
                     "Status change detected by background monitor",

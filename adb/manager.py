@@ -1,3 +1,4 @@
+import os
 import re
 import shlex
 import subprocess
@@ -16,6 +17,7 @@ from utils.paths import ensure_runtime_dir, get_bundle_root
 BASE_DIR = get_bundle_root()
 ADB_EXE = BASE_DIR / "adb" / "adb.exe"
 SCRCPY_EXE = BASE_DIR / "scrcpy" / "scrcpy.exe"
+ADB_DEVICE_REFRESH_DELAY_SECONDS = 0.25
 
 
 def _normalize_args(args):
@@ -24,22 +26,97 @@ def _normalize_args(args):
     return list(args)
 
 
-def run_adb(args, timeout=15, log_timeout=True) -> str:
-    try:
-        result = subprocess.run(
-            [str(ADB_EXE)] + _normalize_args(args),
-            capture_output=True,
-            text=True,
-            cwd=str(ADB_EXE.parent),
-            timeout=timeout
+def _get_windows_subprocess_kwargs():
+    kwargs = {}
+    if os.name != "nt":
+        return kwargs
+
+    startupinfo = subprocess.STARTUPINFO()
+    startupinfo.dwFlags |= subprocess.STARTF_USESHOWWINDOW
+    startupinfo.wShowWindow = 0
+    return {
+        "creationflags": subprocess.CREATE_NO_WINDOW,
+        "startupinfo": startupinfo,
+    }
+
+
+def _decode_process_output(value):
+    if value is None:
+        return ""
+    if isinstance(value, bytes):
+        return value.decode("utf-8", errors="replace").strip()
+    return str(value).strip()
+
+
+def _run_process(
+    command,
+    *,
+    cwd=None,
+    timeout=15,
+    text=True,
+    stdout_target=None,
+):
+    popen_kwargs = {
+        "cwd": cwd,
+        "stdin": subprocess.DEVNULL,
+        "stderr": subprocess.PIPE,
+        "shell": False,
+        **_get_windows_subprocess_kwargs(),
+    }
+
+    if text:
+        popen_kwargs["text"] = True
+        popen_kwargs["encoding"] = "utf-8"
+        popen_kwargs["errors"] = "replace"
+
+    if stdout_target is None:
+        popen_kwargs["stdout"] = subprocess.PIPE
+    else:
+        popen_kwargs["stdout"] = stdout_target
+
+    with subprocess.Popen(command, **popen_kwargs) as process:
+        try:
+            stdout, stderr = process.communicate(timeout=timeout)
+        except subprocess.TimeoutExpired:
+            process.kill()
+            process.communicate()
+            raise
+
+        return (
+            process.returncode,
+            _decode_process_output(stdout),
+            _decode_process_output(stderr),
         )
 
-        stdout = result.stdout.strip()
-        stderr = result.stderr.strip()
+
+def _launch_background_process(command, *, cwd=None):
+    process = subprocess.Popen(  # pylint: disable=consider-using-with
+        command,
+        cwd=cwd,
+        stdin=subprocess.DEVNULL,
+        stdout=subprocess.DEVNULL,
+        stderr=subprocess.DEVNULL,
+        shell=False,
+        **_get_windows_subprocess_kwargs(),
+    )
+    return process
+
+
+def run_adb(args, timeout=15, log_timeout=True, stdout_target=None, text=True) -> str:
+    # Windowed PyInstaller builds do not own a console. On Windows, CREATE_NO_WINDOW
+    # prevents each adb.exe invocation from flashing a transient cmd window.
+    try:
+        returncode, stdout, stderr = _run_process(
+            [str(ADB_EXE)] + _normalize_args(args),
+            cwd=str(ADB_EXE.parent),
+            timeout=timeout,
+            stdout_target=stdout_target,
+            text=text,
+        )
         output = "\n".join(part for part in (stdout, stderr) if part).strip()
 
-        if not output and result.returncode != 0:
-            output = f"adb exited with code {result.returncode}"
+        if not output and returncode != 0:
+            output = f"adb exited with code {returncode}"
 
         return output
 
@@ -56,20 +133,14 @@ def run_adb(args, timeout=15, log_timeout=True) -> str:
 
 def run_host_command(args, timeout=8) -> str:
     try:
-        result = subprocess.run(
+        returncode, stdout, stderr = _run_process(
             list(args),
-            capture_output=True,
-            text=True,
             timeout=timeout,
-            check=False,
         )
-
-        stdout = result.stdout.strip()
-        stderr = result.stderr.strip()
         output = "\n".join(part for part in (stdout, stderr) if part).strip()
 
-        if not output and result.returncode != 0:
-            output = f"command exited with code {result.returncode}"
+        if not output and returncode != 0:
+            output = f"command exited with code {returncode}"
 
         return output
 
@@ -117,13 +188,14 @@ def adb_wake(serial: str) -> str:
 def adb_screenshot(serial: str, filename: str) -> str:
     try:
         with open(filename, "wb") as f:
-            subprocess.run(
-                [str(ADB_EXE), "-s", serial, "exec-out", "screencap", "-p"],
-                stdout=f,
-                cwd=str(ADB_EXE.parent),
+            output = run_adb(
+                ["-s", serial, "exec-out", "screencap", "-p"],
                 timeout=30,
-                check=False
+                stdout_target=f,
+                text=False,
             )
+        if output:
+            return output
         return "OK"
     except Exception as e:
         log_error(str(e))
@@ -135,15 +207,27 @@ def adb_screenshot(serial: str, filename: str) -> str:
 # =========================================================
 
 def launch_scrcpy(serial: str):
-    subprocess.Popen([
-        str(SCRCPY_EXE),
-        "-s", serial,
-        "--render-driver=direct3d",
-        "--max-size", "640",
-        "--video-bit-rate", "600K",
-        "--max-fps", "15",
-        "--no-audio"
-    ], cwd=str(SCRCPY_EXE.parent))
+    try:
+        # scrcpy opens its own GUI window, but we still hide the parent console
+        # process so packaged --noconsole builds stay visually silent.
+        _launch_background_process(
+            [
+                str(SCRCPY_EXE),
+                "-s",
+                serial,
+                "--render-driver=direct3d",
+                "--max-size",
+                "640",
+                "--video-bit-rate",
+                "600K",
+                "--max-fps",
+                "15",
+                "--no-audio",
+            ],
+            cwd=str(SCRCPY_EXE.parent),
+        )
+    except Exception as e:
+        log_error(str(e))
 
 
 # =========================================================
@@ -243,29 +327,38 @@ def classify_device_transport_status(serial: str, transport_status: str) -> str:
     return transport_status
 
 
-def get_all_device_status(refresh_serials=None):
-    refresh_serials = refresh_serials or []
-
-    for serial in refresh_serials:
-        run_adb(["connect", serial], timeout=2, log_timeout=False)
-
-    # Warm-up call to let adb refresh its internal device list.
-    run_adb(["devices"])
-    time.sleep(0.3)
-
-    out = run_adb(["devices"])
+def _parse_adb_device_lines(output: str):
     status_map = {}
-    lines = out.splitlines()[1:]
 
-    for line in lines:
+    for line in output.splitlines()[1:]:
         if not line.strip():
             continue
 
         parts = line.split()
         if len(parts) >= 2:
-            serial = parts[0]
-            status = parts[1]
-            status_map[serial] = status
+            status_map[parts[0]] = parts[1]
+
+    return status_map
+
+
+def get_all_device_status(refresh_serials=None):
+    refresh_serials = [serial for serial in (refresh_serials or []) if serial]
+    status_map = _parse_adb_device_lines(run_adb(["devices"]))
+
+    reconnect_serials = [
+        serial
+        for serial in refresh_serials
+        if status_map.get(serial) in (None, "offline")
+    ]
+
+    if reconnect_serials:
+        # Reconnecting only missing/offline transports keeps the worker from
+        # flooding adb with connect calls when many devices are already healthy.
+        for serial in reconnect_serials:
+            run_adb(["connect", serial], timeout=2, log_timeout=False)
+
+        time.sleep(ADB_DEVICE_REFRESH_DELAY_SECONDS)
+        status_map = _parse_adb_device_lines(run_adb(["devices"]))
 
     for serial in refresh_serials:
         raw_status = status_map.get(serial)
@@ -293,7 +386,6 @@ def get_device_status(serial: str) -> str:
 def auto_reconnect(serial, ip, port):
     if get_device_status(serial) != "CONNECTED":
         adb_connect(ip, port, timeout=2, log_timeout=False)
-        time.sleep(1)
 
 
 def adb_shell(serial, command):
@@ -1005,7 +1097,10 @@ def _collect_inspection_report(serial: str, log_path=None):
                 "HIGH",
                 "ADB",
                 "ADB device offline",
-                "Perangkat terlihat oleh ADB tetapi transport tidak stabil. Biasanya terkait jaringan putus-nyambung atau service adb di STB hang.",
+                (
+                    "Perangkat terlihat oleh ADB tetapi transport tidak stabil. "
+                    "Biasanya terkait jaringan putus-nyambung atau service adb di STB hang."
+                ),
             )
         )
 
@@ -1015,7 +1110,10 @@ def _collect_inspection_report(serial: str, log_path=None):
                 "MEDIUM",
                 "BOOT",
                 "Android belum selesai boot",
-                "ADB sudah merespons, tetapi marker boot belum lengkap. Jika lama berhenti di sini, cek kemungkinan boot loop atau aplikasi launcher macet.",
+                (
+                    "ADB sudah merespons, tetapi marker boot belum lengkap. "
+                    "Jika lama berhenti di sini, cek kemungkinan boot loop atau aplikasi launcher macet."
+                ),
             )
         )
 

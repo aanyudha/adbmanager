@@ -1,5 +1,6 @@
-[MASTER]
+[MAIN]
 ignore=__pycache__
+persistent=no
 
 [MESSAGES CONTROL]
 disable=
@@ -16,6 +17,7 @@ disable=
     too-many-nested-blocks,
     broad-exception-caught,
     subprocess-run-check,
+    no-name-in-module,
     import-outside-toplevel,
     invalid-name,
     import-error
