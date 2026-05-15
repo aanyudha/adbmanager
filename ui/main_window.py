@@ -24,6 +24,7 @@ from PySide6.QtWidgets import (
 
 from adb.device import AndroidDevice, list_devices
 from adb.manager import (
+    SCRCPY_DEBUG_MODE,
     adb_connect,
     append_inspection_checkpoint,
     append_inspection_event,
@@ -1322,8 +1323,39 @@ ABI List       : {info['abi_list']}
             return
 
         self.timer.stop()
-        launch_scrcpy(self.active_serial)
+        result = launch_scrcpy(self.active_serial)
         self.timer.start(ACTIVE_WATCHDOG_INTERVAL_MS)
+
+        if not isinstance(result, dict):
+            QMessageBox.warning(
+                self,
+                "Scrcpy",
+                f"Failed to launch scrcpy\n\n{result}",
+            )
+            return
+
+        debug_text = result.get("debug_text", "").strip()
+        log_path = result.get("log_path", "")
+
+        if SCRCPY_DEBUG_MODE:
+            status_text = (
+                "scrcpy launch requested."
+                if result.get("ok")
+                else "scrcpy launch failed."
+            )
+            details = [status_text]
+            if log_path:
+                details.append(f"Log file: {log_path}")
+            if debug_text:
+                details.extend(["", debug_text])
+            self.info_box.setPlainText("\n".join(details))
+
+        if not result.get("ok"):
+            QMessageBox.warning(
+                self,
+                "Scrcpy",
+                f"Failed to launch scrcpy\n\n{result.get('message', 'Unknown scrcpy error.')}",
+            )
 
     def screenshot_device(self):
         if not self.active_serial:

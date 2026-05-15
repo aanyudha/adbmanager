@@ -1,13 +1,17 @@
+import ctypes
+import hashlib
 import os
 import re
 import shlex
+import shutil
 import subprocess
+import sys
 import time
 from datetime import datetime
 from pathlib import Path
 
 from utils.logger import log_error
-from utils.paths import ensure_runtime_dir, get_bundle_root
+from utils.paths import ensure_runtime_dir, get_bundle_root, get_runtime_path
 
 
 # =========================================================
@@ -16,8 +20,19 @@ from utils.paths import ensure_runtime_dir, get_bundle_root
 
 BASE_DIR = get_bundle_root()
 ADB_EXE = BASE_DIR / "adb" / "adb.exe"
-SCRCPY_EXE = BASE_DIR / "scrcpy" / "scrcpy.exe"
 ADB_DEVICE_REFRESH_DELAY_SECONDS = 0.25
+SCRCPY_DEBUG_MODE = True
+SCRCPY_STARTUP_WAIT_SECONDS = 1.5
+SCRCPY_PROCESS_OUTPUT_MARKER = "SCRCPY PROCESS OUTPUT"
+SCRCPY_REQUIRED_FILES = [
+    "scrcpy.exe",
+    "scrcpy-server",
+    "SDL2.dll",
+    "avcodec-61.dll",
+    "avformat-61.dll",
+    "avutil-59.dll",
+    "swresample-5.dll",
+]
 
 
 def _normalize_args(args):
@@ -38,6 +53,12 @@ def _get_windows_subprocess_kwargs():
         "creationflags": subprocess.CREATE_NO_WINDOW,
         "startupinfo": startupinfo,
     }
+
+
+def _get_windows_gui_subprocess_kwargs():
+    if os.name != "nt":
+        return {}
+    return {}
 
 
 def _decode_process_output(value):
@@ -100,6 +121,297 @@ def _launch_background_process(command, *, cwd=None):
         **_get_windows_subprocess_kwargs(),
     )
     return process
+
+
+def _set_windows_dll_directory(path):
+    if os.name != "nt":
+        return
+
+    ctypes.windll.kernel32.SetDllDirectoryW(path)
+
+
+def _build_tool_signature(source_dir: Path) -> str:
+    digest = hashlib.sha256()
+
+    for source_path in sorted(source_dir.rglob("*")):
+        relative_path = source_path.relative_to(source_dir).as_posix()
+        digest.update(relative_path.encode("utf-8"))
+
+        if source_path.is_file():
+            stats = source_path.stat()
+            digest.update(str(stats.st_size).encode("utf-8"))
+            digest.update(str(stats.st_mtime_ns).encode("utf-8"))
+
+    return digest.hexdigest()[:12]
+
+
+def _ensure_runtime_tool_dir(relative_dir: str) -> Path:
+    source_dir = BASE_DIR / relative_dir
+    if not getattr(sys, "frozen", False):
+        return source_dir
+
+    signature = _build_tool_signature(source_dir)
+    runtime_dir = get_runtime_path("runtime_tools", relative_dir, signature)
+
+    if runtime_dir.exists():
+        return runtime_dir
+
+    # One-file PyInstaller extracts files under _MEIPASS. Long-lived child
+    # processes such as scrcpy must run from a persistent runtime copy so the
+    # bootloader can clean up the temporary _MEI directory after startup.
+    # A versioned cache directory also avoids overwriting scrcpy.exe while an
+    # older mirror session is still using it.
+    runtime_dir.parent.mkdir(parents=True, exist_ok=True)
+    try:
+        shutil.copytree(source_dir, runtime_dir)
+    except FileExistsError:
+        return runtime_dir
+
+    return runtime_dir
+
+
+def _sanitize_external_process_env(runtime_dir: Path):
+    env = os.environ.copy()
+    runtime_dir_str = str(runtime_dir)
+    bundle_root_str = str(BASE_DIR)
+    sanitized_path_entries = []
+
+    for entry in env.get("PATH", "").split(os.pathsep):
+        normalized_entry = entry.strip()
+        if not normalized_entry:
+            continue
+
+        try:
+            resolved_entry = str(Path(normalized_entry).resolve())
+        except OSError:
+            resolved_entry = normalized_entry
+
+        if resolved_entry.startswith(bundle_root_str):
+            continue
+
+        sanitized_path_entries.append(normalized_entry)
+
+    env["PATH"] = os.pathsep.join([runtime_dir_str] + sanitized_path_entries)
+    return env
+
+
+def _read_process_log(log_path: Path) -> str:
+    try:
+        return log_path.read_text(encoding="utf-8", errors="replace").strip()
+    except OSError:
+        return ""
+
+
+def _extract_scrcpy_process_output(log_text: str) -> str:
+    marker = f"{SCRCPY_PROCESS_OUTPUT_MARKER}\n{'-' * len(SCRCPY_PROCESS_OUTPUT_MARKER)}"
+    if marker not in log_text:
+        return log_text.strip()
+    _, output = log_text.split(marker, 1)
+    return output.strip()
+
+
+def _read_scrcpy_process_output(log_path: Path) -> str:
+    return _extract_scrcpy_process_output(_read_process_log(log_path))
+
+
+def _format_block(title: str, lines) -> str:
+    clean_lines = [str(line) for line in lines if line is not None]
+    return "\n".join([title, "-" * len(title), *clean_lines]).strip()
+
+
+def _format_scrcpy_debug_text(details: dict) -> str:
+    sections = [
+        _format_block(
+            "SCRCPY DEBUG",
+            [
+                f"Timestamp      : {details.get('timestamp', '-')}",
+                f"Serial         : {details.get('serial', '-')}",
+                f"ADB Path       : {details.get('adb_path', '-')}",
+                f"ADB Exists     : {details.get('adb_exists', False)}",
+                f"scrcpy Path    : {details.get('scrcpy_path', '-')}",
+                f"scrcpy Exists  : {details.get('scrcpy_exists', False)}",
+                f"Working Dir    : {details.get('cwd', '-')}",
+                f"Log Path       : {details.get('log_path', '-')}",
+                f"Debug Mode     : {details.get('debug_mode', False)}",
+                f"Frozen         : {details.get('frozen', False)}",
+            ],
+        ),
+        _format_block(
+            "COMMAND",
+            [
+                details.get("command_display", "-"),
+            ],
+        ),
+        _format_block(
+            "PREFLIGHT",
+            [
+                f"Serial Format  : {details.get('serial_format', '-')}",
+                f"ADB Start      : {details.get('adb_start_server_output', '-') or '-'}",
+                f"ADB Status     : {details.get('adb_status', '-')}",
+                f"ADB Get-State  : {details.get('adb_get_state', '-') or '-'}",
+                f"Auth Check     : {details.get('authorization_hint', '-')}",
+                f"USB Debugging  : {details.get('usb_debugging_hint', '-')}",
+                f"DLL Check      : {details.get('dll_hint', '-')}",
+                f"Server Binary  : {details.get('server_hint', '-')}",
+            ],
+        ),
+        _format_block(
+            "ADB DEVICES",
+            [
+                details.get("adb_devices_output", "-"),
+            ],
+        ),
+    ]
+
+    if details.get("missing_files"):
+        sections.append(
+            _format_block(
+                "MISSING FILES",
+                details["missing_files"],
+            )
+        )
+
+    if "returncode" in details:
+        sections.append(
+            _format_block(
+                "PROCESS",
+                [
+                    f"Return Code    : {details.get('returncode')}",
+                ],
+            )
+        )
+
+    process_output = details.get("process_output", "").strip()
+    if process_output:
+        sections.append(
+            _format_block(
+                "STDOUT / STDERR",
+                [process_output],
+            )
+        )
+
+    return "\n\n".join(section for section in sections if section).strip()
+
+
+def _write_scrcpy_debug_preamble(log_file, details: dict):
+    preamble = _format_scrcpy_debug_text(details)
+    log_file.write(
+        preamble
+        + "\n\n"
+        + f"{SCRCPY_PROCESS_OUTPUT_MARKER}\n"
+        + f"{'-' * len(SCRCPY_PROCESS_OUTPUT_MARKER)}\n"
+    )
+    log_file.flush()
+
+
+def _get_scrcpy_missing_files(scrcpy_dir: Path):
+    missing_files = []
+    for filename in SCRCPY_REQUIRED_FILES:
+        if not (scrcpy_dir / filename).exists():
+            missing_files.append(str(scrcpy_dir / filename))
+    return missing_files
+
+
+def _get_scrcpy_adb_status(serial: str):
+    devices_output = run_adb(["devices", "-l"], timeout=8, log_timeout=False)
+    status_map = _parse_adb_device_lines(devices_output)
+    adb_status = status_map.get(serial, "")
+
+    adb_get_state = ""
+    if serial:
+        adb_get_state = run_adb(
+            ["-s", serial, "get-state"],
+            timeout=4,
+            log_timeout=False,
+        )
+
+    return devices_output, adb_status, adb_get_state
+
+
+def _build_scrcpy_debug_details(
+    serial: str,
+    *,
+    log_path: Path,
+    scrcpy_dir: Path,
+    scrcpy_exe: Path,
+    command,
+    adb_start_server_output: str,
+):
+    missing_files = _get_scrcpy_missing_files(scrcpy_dir)
+    devices_output, adb_status, adb_get_state = _get_scrcpy_adb_status(serial)
+    serial_format = "OK" if serial and " " not in serial else "INVALID"
+
+    if adb_status == "device":
+        authorization_hint = "ADB device is authorized."
+        usb_debugging_hint = "ADB transport is active and USB/network debugging is enabled."
+    elif adb_status == "unauthorized":
+        authorization_hint = "Device is visible to adb but authorization has not been accepted."
+        usb_debugging_hint = (
+            "Check the device screen and accept the USB debugging prompt."
+        )
+    elif adb_status == "offline":
+        authorization_hint = "ADB transport exists but is offline."
+        usb_debugging_hint = (
+            "ADB is unstable. Check network/USB connectivity and whether Android is still booting."
+        )
+    else:
+        authorization_hint = "Device serial was not found in `adb devices -l`."
+        usb_debugging_hint = (
+            "Check the serial format, USB debugging state, and whether adb connect/start-server has succeeded."
+        )
+
+    dll_hint = (
+        "All required scrcpy-side files are present."
+        if not missing_files
+        else "Missing required files next to scrcpy.exe."
+    )
+    server_hint = (
+        "scrcpy-server is present."
+        if (scrcpy_dir / "scrcpy-server").exists()
+        else "scrcpy-server is missing."
+    )
+
+    return {
+        "timestamp": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+        "serial": serial,
+        "adb_path": str(ADB_EXE),
+        "adb_exists": ADB_EXE.exists(),
+        "scrcpy_path": str(scrcpy_exe),
+        "scrcpy_exists": scrcpy_exe.exists(),
+        "cwd": str(scrcpy_dir),
+        "log_path": str(log_path),
+        "debug_mode": SCRCPY_DEBUG_MODE,
+        "frozen": getattr(sys, "frozen", False),
+        "command_display": subprocess.list2cmdline(command),
+        "serial_format": serial_format,
+        "adb_start_server_output": adb_start_server_output,
+        "adb_devices_output": devices_output,
+        "adb_status": adb_status or "NOT FOUND",
+        "adb_get_state": adb_get_state,
+        "authorization_hint": authorization_hint,
+        "usb_debugging_hint": usb_debugging_hint,
+        "dll_hint": dll_hint,
+        "server_hint": server_hint,
+        "missing_files": missing_files,
+    }
+
+
+def _build_scrcpy_failure_message(details: dict) -> str:
+    technical_reason = details.get("process_output", "").strip()
+    if not technical_reason:
+        technical_reason = details.get("authorization_hint", "")
+    if not technical_reason:
+        technical_reason = "scrcpy failed before it could report a reason."
+
+    return (
+        f"{technical_reason}\n\n"
+        f"Serial: {details.get('serial', '-')}\n"
+        f"ADB: {details.get('adb_path', '-')}\n"
+        f"scrcpy: {details.get('scrcpy_path', '-')}\n"
+        f"Working directory: {details.get('cwd', '-')}\n"
+        f"Return code: {details.get('returncode', '-')}\n"
+        f"Log: {details.get('log_path', '-')}"
+    )
 
 
 def run_adb(args, timeout=15, log_timeout=True, stdout_target=None, text=True) -> str:
@@ -206,28 +518,173 @@ def adb_screenshot(serial: str, filename: str) -> str:
 # SCRCPY
 # =========================================================
 
-def launch_scrcpy(serial: str):
+def launch_scrcpy(serial: str) -> dict:
+    log_dir = ensure_runtime_dir("logs")
+    safe_serial = re.sub(r"[^A-Za-z0-9_.-]+", "_", serial or "unknown")
+    log_path = log_dir / (
+        f"scrcpy_{safe_serial}_{datetime.now().strftime('%Y%m%d_%H%M%S')}.log"
+    )
+
     try:
+        scrcpy_dir = _ensure_runtime_tool_dir("scrcpy")
+        scrcpy_exe = scrcpy_dir / "scrcpy.exe"
+        command = [
+            str(scrcpy_exe),
+            "-s",
+            serial,
+            "--render-driver=direct3d",
+            "--max-size",
+            "640",
+            "--video-bit-rate",
+            "600K",
+            "--max-fps",
+            "15",
+            "--no-audio",
+        ]
+        adb_start_server_output = run_adb(
+            ["start-server"],
+            timeout=5,
+            log_timeout=False,
+        )
+        debug_details = _build_scrcpy_debug_details(
+            serial,
+            log_path=log_path,
+            scrcpy_dir=scrcpy_dir,
+            scrcpy_exe=scrcpy_exe,
+            command=command,
+            adb_start_server_output=adb_start_server_output,
+        )
+
+        if not scrcpy_exe.exists():
+            message = (
+                "scrcpy.exe not found. Please place scrcpy.exe in "
+                f"{scrcpy_exe}"
+            )
+            debug_details["process_output"] = message
+            with open(log_path, "w", encoding="utf-8", errors="replace") as log_file:
+                _write_scrcpy_debug_preamble(log_file, debug_details)
+            log_error(message)
+            return {
+                "ok": False,
+                "message": message,
+                "debug_text": _format_scrcpy_debug_text(debug_details),
+                "log_path": str(log_path),
+            }
+
+        if not ADB_EXE.exists():
+            message = f"adb.exe not found: {ADB_EXE}"
+            debug_details["process_output"] = message
+            with open(log_path, "w", encoding="utf-8", errors="replace") as log_file:
+                _write_scrcpy_debug_preamble(log_file, debug_details)
+            log_error(message)
+            return {
+                "ok": False,
+                "message": message,
+                "debug_text": _format_scrcpy_debug_text(debug_details),
+                "log_path": str(log_path),
+            }
+
+        if debug_details["missing_files"]:
+            message = (
+                "scrcpy dependencies are incomplete.\n\n"
+                + "\n".join(debug_details["missing_files"])
+            )
+            debug_details["process_output"] = message
+            with open(log_path, "w", encoding="utf-8", errors="replace") as log_file:
+                _write_scrcpy_debug_preamble(log_file, debug_details)
+            log_error(message)
+            return {
+                "ok": False,
+                "message": message,
+                "debug_text": _format_scrcpy_debug_text(debug_details),
+                "log_path": str(log_path),
+            }
+
+        scrcpy_env = _sanitize_external_process_env(scrcpy_dir)
+        scrcpy_env["ADB"] = str(ADB_EXE)
+
         # scrcpy opens its own GUI window, but we still hide the parent console
         # process so packaged --noconsole builds stay visually silent.
-        _launch_background_process(
-            [
-                str(SCRCPY_EXE),
-                "-s",
-                serial,
-                "--render-driver=direct3d",
-                "--max-size",
-                "640",
-                "--video-bit-rate",
-                "600K",
-                "--max-fps",
-                "15",
-                "--no-audio",
-            ],
-            cwd=str(SCRCPY_EXE.parent),
-        )
+        if getattr(sys, "frozen", False) and os.name == "nt":
+            _set_windows_dll_directory(None)
+
+        try:
+            with open(log_path, "w", encoding="utf-8", errors="replace") as log_file:
+                _write_scrcpy_debug_preamble(log_file, debug_details)
+                process = subprocess.Popen(  # pylint: disable=consider-using-with
+                    command,
+                    cwd=str(scrcpy_dir),
+                    env=scrcpy_env,
+                    stdin=subprocess.DEVNULL,
+                    stdout=log_file,
+                    stderr=log_file,
+                    shell=False,
+                    **_get_windows_gui_subprocess_kwargs(),
+                )
+        finally:
+            if getattr(sys, "frozen", False) and os.name == "nt":
+                _set_windows_dll_directory(str(BASE_DIR))
+
+        # If scrcpy fails immediately, surface the real stderr instead of
+        # pretending the launch succeeded and forcing the user to guess.
+        time.sleep(SCRCPY_STARTUP_WAIT_SECONDS)
+        returncode = process.poll()
+        if returncode is not None:
+            debug_details["returncode"] = returncode
+            debug_details["process_output"] = _read_scrcpy_process_output(log_path)
+            if not debug_details["process_output"]:
+                debug_details["process_output"] = (
+                    f"scrcpy exited with code {returncode}"
+                )
+            message = _build_scrcpy_failure_message(debug_details)
+            log_error(message)
+            return {
+                "ok": False,
+                "message": message,
+                "debug_text": _format_scrcpy_debug_text(debug_details),
+                "log_path": str(log_path),
+            }
+
+        return {
+            "ok": True,
+            "message": "",
+            "debug_text": _format_scrcpy_debug_text(debug_details),
+            "log_path": str(log_path),
+        }
     except Exception as e:
+        fallback_details = {
+            "timestamp": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+            "serial": serial,
+            "adb_path": str(ADB_EXE),
+            "adb_exists": ADB_EXE.exists(),
+            "scrcpy_path": str(BASE_DIR / "scrcpy" / "scrcpy.exe"),
+            "scrcpy_exists": (BASE_DIR / "scrcpy" / "scrcpy.exe").exists(),
+            "cwd": str(BASE_DIR / "scrcpy"),
+            "log_path": str(log_path),
+            "debug_mode": SCRCPY_DEBUG_MODE,
+            "frozen": getattr(sys, "frozen", False),
+            "command_display": "-",
+            "serial_format": "UNKNOWN",
+            "adb_start_server_output": "",
+            "adb_devices_output": "",
+            "adb_status": "UNKNOWN",
+            "adb_get_state": "",
+            "authorization_hint": "",
+            "usb_debugging_hint": "",
+            "dll_hint": "",
+            "server_hint": "",
+            "missing_files": [],
+            "process_output": str(e),
+        }
+        with open(log_path, "w", encoding="utf-8", errors="replace") as log_file:
+            _write_scrcpy_debug_preamble(log_file, fallback_details)
         log_error(str(e))
+        return {
+            "ok": False,
+            "message": str(e),
+            "debug_text": _format_scrcpy_debug_text(fallback_details),
+            "log_path": str(log_path),
+        }
 
 
 # =========================================================

@@ -78,6 +78,7 @@ python -m PyInstaller `
 - Bundled resources are extracted automatically by PyInstaller.
 - `data\saved_devices.json` is created automatically from `data\saved_devices.template.json`.
 - Writable files such as `data\saved_devices.json`, `screenshots\`, and `logs\inspection_*.log` stay next to the `.exe`.
+- The first `scrcpy` launch copies the bundled `scrcpy` files into a persistent versioned runtime cache so mirror sessions do not depend on PyInstaller's temporary `_MEI` folder.
 - Each `Inspection` run creates a monitor log and appends important status changes such as reboot, booting, offline, and connected.
 - Inspection also summarizes hardware signals that are readable over ADB, including voltage, temperature, memory, storage usage, uptime, and boot reason.
 
